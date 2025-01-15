@@ -186,20 +186,20 @@ namespace TACTTool
                     case "locale":
                         Settings.Locale = ((string)optionValue).ToLower() switch
                         {
-                            "dede" => RootInstance.LocaleFlags.deDE,
-                            "enus" => RootInstance.LocaleFlags.enUS,
-                            "engb" => RootInstance.LocaleFlags.enGB,
-                            "ruru" => RootInstance.LocaleFlags.ruRU,
-                            "zhcn" => RootInstance.LocaleFlags.zhCN,
-                            "zhtw" => RootInstance.LocaleFlags.zhTW,
-                            "entw" => RootInstance.LocaleFlags.enTW,
-                            "eses" => RootInstance.LocaleFlags.esES,
-                            "esmx" => RootInstance.LocaleFlags.esMX,
-                            "frfr" => RootInstance.LocaleFlags.frFR,
-                            "itit" => RootInstance.LocaleFlags.itIT,
-                            "kokr" => RootInstance.LocaleFlags.koKR,
-                            "ptbr" => RootInstance.LocaleFlags.ptBR,
-                            "ptpt" => RootInstance.LocaleFlags.ptPT,
+                            "dede" => WarptenRoot.LocaleFlags.deDE,
+                            "enus" => WarptenRoot.LocaleFlags.enUS,
+                            "engb" => WarptenRoot.LocaleFlags.enGB,
+                            "ruru" => WarptenRoot.LocaleFlags.ruRU,
+                            "zhcn" => WarptenRoot.LocaleFlags.zhCN,
+                            "zhtw" => WarptenRoot.LocaleFlags.zhTW,
+                            "entw" => WarptenRoot.LocaleFlags.enTW,
+                            "eses" => WarptenRoot.LocaleFlags.esES,
+                            "esmx" => WarptenRoot.LocaleFlags.esMX,
+                            "frfr" => WarptenRoot.LocaleFlags.frFR,
+                            "itit" => WarptenRoot.LocaleFlags.itIT,
+                            "kokr" => WarptenRoot.LocaleFlags.koKR,
+                            "ptbr" => WarptenRoot.LocaleFlags.ptBR,
+                            "ptpt" => WarptenRoot.LocaleFlags.ptPT,
                             _ => throw new Exception("Invalid locale. Available locales: deDE, enUS, enGB, ruRU, zhCN, zhTW, enTW, esES, esMX, frFR, itIT, koKR, ptBR, ptPT"),
                         };
                         break;
@@ -353,14 +353,14 @@ namespace TACTTool
                 return;
             }
 
-            var fileEntry = build.Root.GetEntryByFDID(fileDataID);
+            var fileEntry = build.Root.FindFileDataID(fileDataID);
             if (fileEntry == null)
             {
                 Console.WriteLine("Skipping FDID " + fdid + ", not found in root.");
                 return;
             }
 
-            if (!build.Encoding.TryGetEKeys(fileEntry.Value.md5.AsSpan(), out var fileEKeys) || fileEKeys == null)
+            if (!build.Encoding.TryGetEKeys(fileEntry.Value.ContentKey.AsSpan(), out var fileEKeys) || fileEKeys == null)
             {
                 Console.WriteLine("Skipping FDID " + fdid + ", CKey not found in encoding.");
                 return;

@@ -32,11 +32,9 @@ namespace TACTSharp
         /// <returns>A symmetric encryptor object.</returns>
         public Salsa20CryptoTransform CreateEncryptor(ReadOnlySpan<byte> rgbKey, ReadOnlySpan<byte> rgbIV)
         {
-            if (rgbKey == null)
-                throw new ArgumentNullException("rgbKey");
             if (!ValidKeySize(rgbKey.Length * 8))
                 throw new CryptographicException("Invalid key size; it must be 128 or 256 bits.");
-            CheckValidIV(rgbIV, "rgbIV");
+            CheckValidIV(rgbIV);
 
             return new Salsa20CryptoTransform(rgbKey, rgbIV, 20);
         }
@@ -47,10 +45,8 @@ namespace TACTSharp
         }
 
         // Verifies that iv is a legal value for a Salsa20 IV.
-        private static void CheckValidIV(ReadOnlySpan<byte> iv, string paramName)
+        private static void CheckValidIV(ReadOnlySpan<byte> iv)
         {
-            if (iv == null)
-                throw new ArgumentNullException(paramName);
             if (iv.Length != 8)
                 throw new CryptographicException("Invalid IV size; it must be 8 bytes.");
         }
@@ -68,41 +64,29 @@ namespace TACTSharp
 
                 Initialize(key, iv);
                 m_rounds = rounds;
+                m_state = null;
             }
 
-            public bool CanReuseTransform
-            {
-                get { return false; }
-            }
+            public bool CanReuseTransform { get; } = false;
 
-            public bool CanTransformMultipleBlocks
-            {
-                get { return true; }
-            }
+            public bool CanTransformMultipleBlocks { get; } = true;
 
-            public int InputBlockSize
-            {
-                get { return 64; }
-            }
+            public int InputBlockSize { get; } = 64;
 
-            public int OutputBlockSize
-            {
-                get { return 64; }
-            }
+            public int OutputBlockSize { get; } = 64;
 
             public int TransformBlock(ReadOnlySpan<byte> inputBuffer, int inputOffset, int inputCount, byte[] outputBuffer, int outputOffset)
             {
-                // check arguments
-                if (inputBuffer == null)
-                    throw new ArgumentNullException("inputBuffer");
+                if (inputBuffer == Span<byte>.Empty)
+                    throw new ArgumentNullException(nameof(inputBuffer));
                 if (inputOffset < 0 || inputOffset >= inputBuffer.Length)
-                    throw new ArgumentOutOfRangeException("inputOffset");
+                    throw new ArgumentOutOfRangeException(nameof(inputOffset));
                 if (inputCount < 0 || inputOffset + inputCount > inputBuffer.Length)
-                    throw new ArgumentOutOfRangeException("inputCount");
+                    throw new ArgumentOutOfRangeException(nameof(inputCount));
                 if (outputBuffer == null)
-                    throw new ArgumentNullException("outputBuffer");
+                    throw new ArgumentNullException(nameof(outputBuffer));
                 if (outputOffset < 0 || outputOffset + inputCount > outputBuffer.Length)
-                    throw new ArgumentOutOfRangeException("outputOffset");
+                    throw new ArgumentOutOfRangeException(nameof(outputOffset));
                 if (m_state == null)
                     throw new ObjectDisposedException(GetType().Name);
 
@@ -135,7 +119,7 @@ namespace TACTSharp
             public byte[] TransformFinalBlock(ReadOnlySpan<byte> inputBuffer, int inputOffset, int inputCount)
             {
                 if (inputCount < 0)
-                    throw new ArgumentOutOfRangeException("inputCount");
+                    throw new ArgumentOutOfRangeException(nameof(inputCount));
 
                 byte[] output = new byte[inputCount];
                 TransformBlock(inputBuffer, inputOffset, inputCount, output, 0);
@@ -253,8 +237,8 @@ namespace TACTSharp
             static readonly byte[] c_sigma = Encoding.ASCII.GetBytes("expand 32-byte k");
             static readonly byte[] c_tau = Encoding.ASCII.GetBytes("expand 16-byte k");
 
-            uint[] m_state;
-            readonly int m_rounds;
+            private uint[] m_state;
+            private readonly int m_rounds;
         }
     }
 }

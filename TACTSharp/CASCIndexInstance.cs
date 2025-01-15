@@ -104,6 +104,7 @@ namespace TACTSharp
             }
         }
 
+        #pragma warning disable 0649
         private unsafe struct IndexHeader
         {
             public uint headerHashSize;
@@ -120,5 +121,6 @@ namespace TACTSharp
             public uint entriesSize;
             public uint entriesHash;
         }
+        #pragma warning restore 0649
     }
 }

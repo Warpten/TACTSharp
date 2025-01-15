@@ -6,7 +6,7 @@
         public Config CDNConfig { get; private set; }
 
         public EncodingInstance? Encoding { get; private set; }
-        public RootInstance? Root { get; private set; }
+        public WarptenRoot? Root { get; private set; }
         public InstallInstance? Install { get; private set; }
         public IndexInstance? GroupIndex { get; private set; }
         public IndexInstance? FileIndex { get; private set; }
@@ -90,7 +90,7 @@
             if (!Encoding.TryGetEKeys(Convert.FromHexString(rootKey[0]), out var rootEKeys) || rootEKeys == null)
                 throw new Exception("Root key not found in encoding");
 
-            Root = new RootInstance(await CDN.GetDecodedFilePath("wow", "data", Convert.ToHexStringLower(rootEKeys.Value.eKeys[0]), 0, rootEKeys.Value.decodedFileSize));
+            Root = new (await CDN.GetDecodedFilePath("wow", "data", Convert.ToHexStringLower(rootEKeys.Value.eKeys[0]), 0, rootEKeys.Value.decodedFileSize));
             timer.Stop();
             Console.WriteLine("Root loaded in " + Math.Ceiling(timer.Elapsed.TotalMilliseconds) + "ms");
 
@@ -111,14 +111,14 @@
             if (Root == null)
                 throw new Exception("Root not loaded");
 
-            var fileData = Root.GetEntryByFDID(fileDataID) ?? throw new Exception("File not found in root");
+            var fileData = Root.FindFileDataID(fileDataID) ?? throw new Exception("File not found in root");
 
-            return OpenFileByCKey(fileData.md5);
+            return OpenFileByCKey(fileData.ContentKey);
         }
 
         public byte[] OpenFileByCKey(string cKey) => OpenFileByCKey(Convert.FromHexString(cKey));
 
-        public byte[] OpenFileByCKey(Span<byte> cKey)
+        public byte[] OpenFileByCKey(ReadOnlySpan<byte> cKey)
         {
             if (Encoding == null)
                 throw new Exception("Encoding not loaded");

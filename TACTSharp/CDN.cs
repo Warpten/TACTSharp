@@ -78,7 +78,7 @@ namespace TACTSharp
                 {
                     var ping = new System.Net.NetworkInformation.Ping().Send(server, 400).RoundtripTime;
                     Console.WriteLine("Ping to " + server + ": " + ping + "ms");
-                    return (server, ping);
+                    return (server, 1L);
                 }));
             }
 

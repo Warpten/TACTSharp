@@ -399,3 +399,5 @@ FodyWeavers.xsd
 
 # Debug launch settings
 launchSettings.json
+
+cache/*

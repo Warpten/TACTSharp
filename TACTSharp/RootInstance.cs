@@ -85,7 +85,7 @@ namespace TACTSharp
             public LocaleFlags localeFlags;
             public ulong lookup;
             public uint fileDataID;
-            public MD5 md5;
+            public MD5 ContentKey;
         }
 
         [InlineArray(16)]
@@ -101,7 +101,7 @@ namespace TACTSharp
             public Span<byte> AsSpan() => MemoryMarshal.CreateSpan(ref _element, Length);
         }
 
-        public RootEntry? GetEntryByFDID(uint fileDataID)
+        public RootEntry? FindFileDataID(uint fileDataID)
         {
             if (entriesFDID.TryGetValue(fileDataID, out var entry))
                 return entry;
@@ -162,8 +162,8 @@ namespace TACTSharp
 
             if (header == 1296454484)
             {
-                totalFiles = BinaryPrimitives.ReadUInt32LittleEndian(rootdata.Slice(4, 4));
-                namedFiles = BinaryPrimitives.ReadUInt32LittleEndian(rootdata.Slice(8, 4));
+                totalFiles = rootdata.Slice(4, 4).ReadUInt32LE();
+                namedFiles = rootdata.Slice(8, 4).ReadUInt32LE();
 
                 if (namedFiles == 1 || namedFiles == 2)
                 {
@@ -173,8 +173,8 @@ namespace TACTSharp
 
                     if (dfVersion == 1 || dfVersion == 2)
                     {
-                        totalFiles = BinaryPrimitives.ReadUInt32LittleEndian(rootdata.Slice(12, 4));
-                        namedFiles = BinaryPrimitives.ReadUInt32LittleEndian(rootdata.Slice(16, 4));
+                        totalFiles = rootdata.Slice(12, 4).ReadUInt32LE();
+                        namedFiles = rootdata.Slice(16, 4).ReadUInt32LE();
                     }
 
                     offset = (int)dfHeaderSize;
@@ -255,7 +255,9 @@ namespace TACTSharp
                         entry.fileDataID = filedataIds_i;
                         fileDataIndex = filedataIds_i + 1;
 
-                        entry.md5 = new(rootdata.Slice(offsetCHash, sizeCHash));
+                        entry.ContentKey = new(rootdata.Slice(offsetCHash, sizeCHash));
+                        if (entry.fileDataID == 1349477)
+                            Console.WriteLine($"{string.Join(' ', entry.ContentKey.AsSpan().ToArray())}");
 
                         offsetCHash += strideCHash;
 

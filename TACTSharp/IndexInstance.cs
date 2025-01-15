@@ -1,5 +1,8 @@
 ﻿using Microsoft.Win32.SafeHandles;
+using System.Collections;
+using System.Diagnostics;
 using System.IO.MemoryMappedFiles;
+using System.Security.Cryptography.X509Certificates;
 
 namespace TACTSharp
 {
@@ -76,37 +79,93 @@ namespace TACTSharp
             return begin;
         }
 
-        public unsafe List<(byte[] eKey, int offset, int size)> GetAllEntries()
-        {
-            var entries = new List<(byte[] eKey, int offset, int size)>();
+        public readonly ref struct Entry(ReadOnlySpan<byte> encodingKey, int offset, int size) {
+            public readonly ReadOnlySpan<byte> EKey = encodingKey;
+            public readonly int Offset = offset;
+            public readonly int Size = size;
 
-            byte* fileData = null;
-            try
+            internal void Deconstruct(out ReadOnlySpan<byte> eKey, out int offset, out int size)
             {
-                mmapViewHandle.AcquirePointer(ref fileData);
-                for (var i = 0; i < this.numBlocks; i++)
-                {
-                    byte* startOfBlock = fileData + (i * this.blockSizeBytes);
-                    var blockSpan = new ReadOnlySpan<byte>(startOfBlock, this.blockSizeBytes);
-                    for (var j = 0; j < this.entriesPerBlock; j++)
-                    {
-                        var entry = blockSpan.Slice(j * this.entrySize, this.entrySize);
-                        var eKey = entry[..footer.keyBytes].ToArray();
-                        var offset = entry.Slice(footer.keyBytes + footer.sizeBytes, footer.offsetBytes).ReadInt32BE();
-                        var size = entry.Slice(footer.keyBytes, footer.sizeBytes).ReadInt32BE();
+                eKey = EKey;
+                offset = Offset;
+                size = Size;
+            }
+        }
 
-                        if (size != 0)
-                            entries.Add((eKey, offset, size));
+        private unsafe class Enumerator : IEnumerable<Entry>, IEnumerator<Entry> {
+            private byte* rawData;
+
+            // Block iteration
+            private int blockIndex = 0;
+
+            // Entries iteration per block
+            private int entryIndex = -1;
+
+            private IndexInstance index;
+            
+            public Enumerator(IndexInstance index)
+            {
+                this.index = index;
+                this.index.mmapViewHandle.AcquirePointer(ref this.rawData);
+            }
+
+            public Entry Current => Find(this.blockIndex, this.entryIndex);
+
+            private Entry Find(int blockIdx, int entryIdx) {
+                ReadOnlySpan<byte> blockData = new (this.rawData + this.index.blockSizeBytes * blockIdx, this.index.blockSizeBytes);
+                var entry = blockData.Slice(entryIdx * this.index.entrySize, this.index.entrySize);
+                
+                var eKey = entry[..this.index.footer.keyBytes];
+                var offset = entry.Slice(this.index.footer.keyBytes + this.index.footer.sizeBytes, this.index.footer.offsetBytes).ReadInt32BE();
+                var size = entry.Slice(this.index.footer.keyBytes, this.index.footer.sizeBytes).ReadInt32BE();
+
+                // Debug.Assert(size != 0);
+                return new Entry(eKey, offset, size);
+            }
+
+            object IEnumerator.Current => throw new InvalidOperationException();
+
+            public bool MoveNext() {
+                // Someone optimize this to eliminate branches as much as possible
+                if (this.blockIndex >= this.index.numBlocks)
+                    return false;
+
+                if (this.entryIndex >= this.index.entriesPerBlock)
+                    return false;
+
+                while (this.blockIndex < this.index.numBlocks) {
+                    ++this.entryIndex;
+                    if (this.entryIndex < this.index.entriesPerBlock) {
+                        if (Current.Size != 0)
+                            return true;
                     }
+
+                    this.entryIndex = -1;
+                    ++this.blockIndex;
                 }
-            }
-            finally
-            {
-                if (fileData != null)
-                    mmapViewHandle.ReleasePointer();
+
+                // Expended all blocks
+                return false;
             }
 
-            return entries;
+            public void Reset() {
+                this.entryIndex = 0;
+                this.blockIndex = 0;
+            }
+
+            public IEnumerator<Entry> GetEnumerator() => this;
+            IEnumerator IEnumerable.GetEnumerator() => this;
+
+            public void Dispose() {
+                if (this.rawData != null)
+                    this.index.mmapViewHandle.ReleasePointer();
+
+                this.rawData = null;
+            }
+        }
+
+        public IEnumerable<Entry> Enumerate() {
+            return new Enumerator(this);
         }
 
         unsafe public (int offset, int size, int archiveIndex) GetIndexInfo(Span<byte> eKeyTarget)
@@ -167,6 +226,8 @@ namespace TACTSharp
             }
         }
 
+        //  Field '...' is never assigned to, and will always have its default value ...
+        #pragma warning disable 0649
         private unsafe struct IndexFooter
         {
             public byte formatRevision;
@@ -180,5 +241,6 @@ namespace TACTSharp
             public uint numElements;
             public fixed byte bytefooterHash[8];
         }
+        #pragma warning restore 0649
     }
 }

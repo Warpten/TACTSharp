@@ -15,7 +15,6 @@ namespace TACTSharp
         }
 
         private static readonly List<IndexEntry> Entries = [];
-        private static readonly Lock entryLock = new();
 
         public static string Generate(string? hash, string[] archives)
         {
@@ -26,35 +25,39 @@ namespace TACTSharp
 
             Console.WriteLine("Loading " + archives.Length + " index files");
 
-            Parallel.For(0, archives.Length, archiveIndex =>
-            {
-                string indexPath = "";
-                if (!string.IsNullOrEmpty(Settings.BaseDir) && File.Exists(Path.Combine(Settings.BaseDir, "Data", "indices", archives[archiveIndex] + ".index")))
-                {
-                    indexPath = Path.Combine(Settings.BaseDir, "Data", "indices", archives[archiveIndex] + ".index");
-                }
-                else
-                {
-                    _ = CDN.GetFile("wow", "data", archives[archiveIndex] + ".index").Result;
-                    indexPath = Path.Combine("cache", "wow", "data", archives[archiveIndex] + ".index");
-                }
-
-                var index = new IndexInstance(indexPath);
-                var allEntries = index.GetAllEntries();
-                foreach (var (eKey, offset, size) in allEntries)
-                {
-                    lock (entryLock)
+            Lock accumulationLock = new();
+            Parallel.ForEach(
+                Enumerable.Range(0, archives.Length)
+                    .Select(archiveIndex => (archive: archives[archiveIndex], idx: (short) archiveIndex)),
+                () => new List<IndexEntry>(),
+                (itr, state, subtotal) => {
+                    string indexPath = "";
+                    if (!string.IsNullOrEmpty(Settings.BaseDir) && File.Exists(Path.Combine(Settings.BaseDir, "Data", "indices", itr.archive + ".index")))
                     {
-                        Entries.Add(new IndexEntry
-                        {
-                            EKey = eKey,
-                            Size = (uint)size,
-                            ArchiveIndex = (ushort)archiveIndex,
-                            Offset = (uint)offset
+                        indexPath = Path.Combine(Settings.BaseDir, "Data", "indices", itr.archive + ".index");
+                    }
+                    else
+                    {
+                        _ = CDN.GetFile("wow", "data", itr.archive + ".index").Result;
+                        indexPath = Path.Combine("cache", "wow", "data", itr.archive + ".index");
+                    }
+
+                    var index = new IndexInstance(indexPath, itr.idx);
+                    foreach (var (eKey, offset, size) in index.Enumerate()) {
+                        subtotal.Add(new IndexEntry {
+                            EKey = eKey.ToArray(),
+                            Size = (uint) size,
+                            Offset = (uint) offset,
+                            ArchiveIndex = (ushort) itr.idx
                         });
                     }
-                }
-            });
+
+                    return subtotal;
+                },
+                subtotal => {
+                    lock (accumulationLock)
+                        Entries.AddRange(subtotal);
+                });
 
             Console.WriteLine("Done loading index files, got " + Entries.Count + " entries");
 
@@ -75,7 +78,7 @@ namespace TACTSharp
                 numElements = (uint)Entries.Count
             };
 
-            var outputBlockSizeBytes = outputFooter.blockSizeKBytes * 1024;
+            var outputBlockSizeBytes = outputFooter.blockSizeKBytes << 10;
             var outputEntrySize = outputFooter.keyBytes + outputFooter.sizeBytes + outputFooter.offsetBytes;
             var outputEntriesPerBlock = outputBlockSizeBytes / outputEntrySize;
             var outputNumBlocks = (int)Math.Ceiling((double)outputFooter.numElements / outputEntriesPerBlock);
@@ -158,7 +161,7 @@ namespace TACTSharp
                 if (!string.IsNullOrEmpty(hash))
                 {
                     if (fullFooterMD5Hash != hash)
-                        throw new Exception("Footer MD5 of group index does not match group index filename");
+                        throw new Exception($"Footer MD5 of group index does not match group index filename; found {fullFooterMD5Hash}");
 
                     File.WriteAllBytes(Path.Combine("cache", "wow", "data", hash + ".index"), ms.ToArray());
                 }
