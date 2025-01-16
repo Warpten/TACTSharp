@@ -1,4 +1,6 @@
-﻿namespace TACTSharp
+﻿using System.Runtime.CompilerServices;
+
+namespace TACTSharp
 {
     public class BuildInstance
     {
@@ -111,7 +113,9 @@
             if (Root == null)
                 throw new Exception("Root not loaded");
 
-            var fileData = Root.FindFileDataID(fileDataID) ?? throw new Exception("File not found in root");
+            ref readonly var fileData = ref Root.FindFileDataID(fileDataID);
+            if (Unsafe.IsNullRef(in fileData))
+                throw new Exception("File not found in root");
 
             return OpenFileByCKey(fileData.ContentKey);
         }

@@ -11,7 +11,7 @@ namespace TACTSharp
             Greater,
         }
 
-        public delegate Ordering BinarySearchPredicate<T>(T entry);
+        public delegate Ordering BinarySearchPredicate<T>(ref T entry);
 
         public static Ordering ToOrdering(this int comparison)
             => comparison switch
@@ -37,7 +37,7 @@ namespace TACTSharp
             while (left < right)
             {
                 var mid = left + size / 2;
-                var ordering = cmp(array[mid]);
+                var ordering = cmp(ref array.UnsafeIndex(mid));
 
                 left = ordering switch
                 {

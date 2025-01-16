@@ -350,17 +350,17 @@ namespace TACTTool
             if (!uint.TryParse(fdid, out var fileDataID))
             {
                 Console.WriteLine("Skipping FDID " + fdid + ", invalid input format (expected unsigned integer).");
-                return;
+                return; 
             }
 
-            var fileEntry = build.Root.FindFileDataID(fileDataID);
-            if (fileEntry == null)
+            ref readonly var fileEntry = ref build.Root.FindFileDataID(fileDataID);
+            if (Unsafe.IsNullRef(in fileEntry))
             {
                 Console.WriteLine("Skipping FDID " + fdid + ", not found in root.");
                 return;
             }
 
-            if (!build.Encoding.TryGetEKeys(fileEntry.Value.ContentKey.AsSpan(), out var fileEKeys) || fileEKeys == null)
+            if (!build.Encoding.TryGetEKeys(fileEntry.ContentKey, out var fileEKeys) || fileEKeys == null)
             {
                 Console.WriteLine("Skipping FDID " + fdid + ", CKey not found in encoding.");
                 return;

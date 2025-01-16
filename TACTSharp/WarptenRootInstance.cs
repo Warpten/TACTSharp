@@ -13,7 +13,6 @@ namespace TACTSharp
     public class WarptenRoot
     {
         private readonly Page[] _pages;
-        private readonly Dictionary<ulong, (int, int)> _hashes = [];
 
         [Flags]
         public enum LocaleFlags : uint
@@ -84,20 +83,20 @@ namespace TACTSharp
             var pages = new List<Page>();
             while (fileData.Length != 0) {
                 var recordCount = fileData.Consume(4).ReadInt32LE();
-                var (contentFlags, localeFlags) = ParseManifestPageFlags(ref fileData, version);
+                var pageHeader = ParseManifestPageHeader(ref fileData, version);
 
                 // No records in this file.
                 if (recordCount == 0)
                     continue;
 
                 // Determine conditions related to keeping this page.
-                var localeSkip = !localeFlags.HasFlag(LocaleFlags.All_WoW) && !localeFlags.HasFlag(Settings.Locale);
-                var contentSkip = (contentFlags & ContentFlags.LowViolence) != 0;
+                var localeSkip = !pageHeader.HasFlag(LocaleFlags.All_WoW) && !pageHeader.HasFlag(Settings.Locale);
+                var contentSkip = pageHeader.HasFlag(ContentFlags.LowViolence);
 
                 // Calculate block size
                 var blockSize = 4 * recordCount;
                 blockSize += MD5.Length * recordCount;
-                if (format == Format.Legacy || !(allowUnnamedFiles && contentFlags.HasFlag(ContentFlags.NoNames)))
+                if (format == Format.Legacy || !(allowUnnamedFiles && !pageHeader.HasNames))
                     blockSize += 8 * recordCount;
 
                 var blockData = fileData.Consume(blockSize);
@@ -116,33 +115,19 @@ namespace TACTSharp
 
                 // Parse records according to their specification.
                 var records = format switch {
-                    Format.Legacy => ParseLegacy(ref blockData, recordCount, fdids),
-                    Format.MFST => ParseManifest(ref blockData, recordCount, contentFlags, allowUnnamedFiles, fdids),
+                    Format.Legacy => ParseLegacy(ref blockData, recordCount, fdids, pageHeader),
+                    Format.MFST => ParseManifest(ref blockData, recordCount, allowUnnamedFiles, fdids, pageHeader),
                     _ => throw new UnreachableException()
                 };
 
-                var page = new Page(records, contentFlags, localeFlags);
+                var page = new Page(pageHeader, records);
                 pages.Add(page);
             }
-            pages.SortBy(page => page.Records[0].FileDataID);
+
             _pages = [.. pages];
-
-
-            Debug.Assert(format == Format.Legacy || totalFileCount == pages.Sum(p => p.Records.Length));
-
-            for (var i = 0; i < _pages.Length; ++i) {
-                var page = pages[i];
-                if (allowUnnamedFiles && page.ContentFlags.HasFlag(ContentFlags.NoNames)) {
-                    for (var j = 0; j < page.Records.Length; ++j)
-                        if (page.Records[j].NameHash != 0)
-                            _hashes.Add(page.Records[j].NameHash, (i, j));
-                }
-            }
-
-            _hashes.TrimExcess();
         }
 
-        private static (ContentFlags contentFlags, LocaleFlags localeFlags) ParseManifestPageFlags(ref ReadOnlySpan<byte> fileData, int version) {
+        private static PageHeader ParseManifestPageHeader(ref ReadOnlySpan<byte> fileData, int version) {
             switch (version)
             {
                 case 0:
@@ -153,7 +138,7 @@ namespace TACTSharp
 
                     fileData.Consume(4 + 4);
 
-                    return (contentFlags, localeFlags);
+                    return new(contentFlags, localeFlags);
                 }
                 case 2:
                 {
@@ -167,7 +152,7 @@ namespace TACTSharp
 
                     var contentFlags = (ContentFlags) (unk1 | unk2 | unk3);
 
-                    return (contentFlags, localeFlags);
+                    return new(contentFlags, localeFlags);
                 }
                 default:
                     throw new NotImplementedException($"MFST version {version} is not supported");
@@ -178,54 +163,42 @@ namespace TACTSharp
         /// Finds a file given a file data ID.
         /// </summary>
         /// <param name="fileDataID">The file data ID to look for.</param>
-        /// <returns>An optional record.</returns>
-        public Record? FindFileDataID(uint fileDataID)
+        /// <returns>An optional record as well as the associated content and locale flags.</returns>
+        public ref readonly Record FindFileDataID(uint fileDataID)
         {
-            #if true
-            foreach (var (i, page) in _pages.Index()) {
-                foreach (var record in page.Records)
-                {
-                    if (record.FileDataID == fileDataID)
-                    return record;
-                }
+            foreach (ref readonly var page in _pages.AsSpan()) {
+                var fdidIndex = page.Records.BinarySearchBy((ref Record record) => (record.FileDataID - (int) fileDataID).ToOrdering());
+                if (fdidIndex == -1)
+                    continue;
+
+                return ref page.Records.UnsafeIndex(fdidIndex);
             }
-
-            return null;
-            #else
-            var pageIndex = _pages.BinarySearchBy(page => {
-                if (fileDataID < page.Records[0].FileDataID)
-                    return Ordering.Less;
-                else if (page.Records.Any(rec => rec.FileDataID == fileDataID))
-                    return Ordering.Equal;
-                else
-                    return Ordering.Greater;
-            });
-
-            var page = _pages.UnsafeIndex(pageIndex);
-            var recordIndex = page.Records.BinarySearchBy(record => record.FileDataID.CompareTo(fileDataID).ToOrdering());
-            if (recordIndex != -1)
-                return page.Records.UnsafeIndex(recordIndex);
-
-            return null;
-            #endif
+            
+            return ref Unsafe.NullRef<Record>();
         }
 
         /// <summary>
         /// Finds a record as identified by its name hash (also known as lookup).
         /// </summary>
         /// <param name="nameHash">The hash of the file's complete path in the game's file structure.</param>
-        /// <returns>An optional record.</returns>
-        public Record? FindHash(ulong nameHash)
+        /// <returns>An optional record as well as the associated content and locale flags.</returns>
+        public ref readonly Record FindHash(ulong nameHash)
         {
-            if (_hashes.TryGetValue(nameHash, out (int pageIndex, int recordIndex) value)) {
-                var page = _pages.UnsafeIndex(value.pageIndex);
-                return page.Records.UnsafeIndex(value.recordIndex);
+            foreach (ref readonly var page in _pages.AsSpan()) {
+                if (!page.Header.HasNames)
+                    continue;
+
+                for (var i = 0; i < page.Records.Length; ++i) {
+                    ref readonly var record = ref page.Records.UnsafeIndex(i);
+                    if (record.NameHash == nameHash)
+                        return ref record;
+                }
             }
 
-            return null;
+            return ref Unsafe.NullRef<Record>();
         }
 
-        private static Record[] ParseLegacy(ref ReadOnlySpan<byte> dataStream, int recordCount, int[] fdids)
+        private Record[] ParseLegacy(ref ReadOnlySpan<byte> dataStream, int recordCount, int[] fdids, PageHeader header)
         {
             var records = GC.AllocateUninitializedArray<Record>(recordCount);
             for (var i = 0; i < records.Length; ++i) {
@@ -238,30 +211,31 @@ namespace TACTSharp
             return records;
         }
 
-        private static Record[] ParseManifest(ref ReadOnlySpan<byte> dataStream, int recordCount, ContentFlags contentFlags, bool allowUnnamedFiles, int[] fdids)
+        private static Record[] ParseManifest(ref ReadOnlySpan<byte> dataStream, int recordCount,
+            bool allowUnnamedFiles, int[] fdids, PageHeader pageHeader)
         {
-            var nameHashSize = (!(allowUnnamedFiles && contentFlags.HasFlag(ContentFlags.NoNames))).UnsafePromote() << 3;
+            var nameHashSize = (!(allowUnnamedFiles && !pageHeader.HasNames)).UnsafePromote() << 3;
             nameHashSize *= recordCount;
 
             var ckr = new Range(0, recordCount * MD5.Length); // Content key range
             var nhr = new Range(ckr.End.Value, ckr.End.Value + nameHashSize); // Name hash range
 
             var sectionContents = dataStream.Consume(nhr.End.Value);
-            var contentKeys = sectionContents[ckr];
-            var nameHashes = sectionContents[nhr];
+            var contentKeys = MemoryMarshal.Cast<byte, MD5>(sectionContents[ckr]);
+            // TODO: This becomes tied to platform endianness.
+            var nameHashes = MemoryMarshal.Cast<byte, ulong>(sectionContents[nhr]);
 
             var records = GC.AllocateUninitializedArray<Record>(recordCount);
             for (var i = 0; i < recordCount; ++i)
             {
-                var contentKey = new MD5(contentKeys.Slice(i * MD5.Length, MD5.Length));
-
                 var nameHash = nameHashes.Length switch {
-                    >= 8 => nameHashes[(8 * i)..].ReadUInt64LE(),
+                    >= 8 => nameHashes[i],
                     _ => 0uL
                 };
 
-                records[i] = new(contentKey, nameHash, fdids[i]);
+                records[i] = new(contentKeys[i], nameHash, fdids[i]);
             }
+
             return records;
         }
 
@@ -300,7 +274,17 @@ namespace TACTSharp
             public readonly int FileDataID = fileDataID;
         }
         
-        private record struct Page(Record[] Records, ContentFlags ContentFlags, LocaleFlags LocaleFlags);
+        private record struct PageHeader(ContentFlags ContentFlags, LocaleFlags LocaleFlags) {
+            public bool HasNames = !ContentFlags.HasFlag(ContentFlags.NoNames);
+
+            [MethodImpl(MethodImplOptions.AggressiveInlining)]
+            public bool HasFlag(ContentFlags contentFlags) => ContentFlags.HasFlag(contentFlags);
+
+            [MethodImpl(MethodImplOptions.AggressiveInlining)]
+            public bool HasFlag(LocaleFlags localeFlags) => LocaleFlags.HasFlag(localeFlags);
+        }
+
+        private record struct Page(PageHeader Header, Record[] Records);
 
         private enum Format
         {
