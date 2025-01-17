@@ -5,8 +5,7 @@ namespace TACTBench
 {
     public class Program
     {
-        public static void Main() {
-            var summary = BenchmarkRunner.Run<Benchmarks>();
-        }
+        public static void Main(string[] args)
+            => BenchmarkSwitcher.FromAssembly(typeof(Program).Assembly).Run(args);
     }
 }

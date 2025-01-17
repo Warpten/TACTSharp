@@ -2,36 +2,77 @@
 
 namespace TACTSharp
 {
+    public readonly struct Configuration(Identifier buildConfig, Identifier cdnConfig)
+    {
+        public readonly Config Build = buildConfig.Open();
+        public readonly Config CDN = cdnConfig.Open();
+
+        public readonly BuildInstance Open(Settings settings) => new BuildInstance(settings, this);
+    }
+
     public class BuildInstance
     {
-        public Config BuildConfig { get; private set; }
-        public Config CDNConfig { get; private set; }
+        public readonly Configuration Configuration;
+        public readonly Settings Settings;
 
-        public EncodingInstance? Encoding { get; private set; }
-        public WarptenRoot? Root { get; private set; }
-        public InstallInstance? Install { get; private set; }
-        public IndexInstance? GroupIndex { get; private set; }
-        public IndexInstance? FileIndex { get; private set; }
+        public readonly EncodingInstance Encoding;
+        public readonly WarptenRoot Root;
+        public readonly InstallInstance Install;
+        public readonly IndexInstance? GroupIndex;
+        public readonly IndexInstance FileIndex;
 
-        public BuildInstance(string buildConfig, string cdnConfig)
+        public Config BuildConfig => Configuration.Build;
+        public Config CDNConfig => Configuration.CDN;
+
+        public BuildInstance(Settings settings, Configuration configuration)
         {
-            // Always load configs so we have basic information available, loading the full build is optional.
-            var timer = new System.Diagnostics.Stopwatch();
-            timer.Start();
-            if (File.Exists(buildConfig))
-                BuildConfig = new Config(buildConfig, true);
-            else if (buildConfig.Length == 32 && buildConfig.All(c => "0123456789abcdef".Contains(c)))
-                BuildConfig = new Config(buildConfig, false);
+            Settings = settings;
+            Configuration = configuration;
 
-            if (File.Exists(cdnConfig))
-                CDNConfig = new Config(cdnConfig, true);
-            else if (cdnConfig.Length == 32 && cdnConfig.All(c => "0123456789abcdef".Contains(c)))
-                CDNConfig = new Config(cdnConfig, false);
+            var hasBaseDir = !string.IsNullOrEmpty(Settings.BaseDir);
 
-            if (BuildConfig == null || CDNConfig == null)
-                throw new Exception("Failed to load configs");
-            timer.Stop();
-            Console.WriteLine("Configs loaded in " + Math.Ceiling(timer.Elapsed.TotalMilliseconds) + "ms");
+            
+            { // 1. Load (or generate from individual indices) archive-group.
+                if (!CDNConfig.Values.TryGetValue("archive-group", out var groupArchiveIndex))
+                {
+                    var groupIndexHash = TACTSharp.GroupIndex.Generate(null, CDNConfig.Values["archives"]);
+                    var groupIndexPath = Path.Combine("cache/wow/data", groupIndexHash + ".index");
+                    GroupIndex = new IndexInstance(groupIndexPath);
+                }
+                else if (hasBaseDir)
+                {
+                    var filePath = Path.Combine(Settings.BaseDir!, "Data/indices", groupArchiveIndex[0] + ".index");
+                    if (File.Exists(filePath))
+                    {
+                        GroupIndex = new IndexInstance(filePath);
+                    }
+                    else
+                    {
+                        if (!File.Exists(filePath))
+                            TACTSharp.GroupIndex.Generate(groupArchiveIndex[0], CDNConfig.Values["archives"]);
+
+                        GroupIndex = new IndexInstance(filePath);
+                    }
+                }
+            }
+
+            { // 2. Load file-index.
+                if (!CDNConfig.Values.TryGetValue("file-index", out var fileIndex))
+                    throw new Exception("No file index found in CDN config");
+
+                if (hasBaseDir) {
+                    var filePath = Path.Combine(Settings.BaseDir!, "Data/indices", fileIndex[0] + ".index");
+                    if (File.Exists(filePath))
+                    {
+                        FileIndex = new IndexInstance(filePath);
+                    }
+                    else
+                    {
+                        var fileIndexPath = await CDN.GetFilePath("wow", "data", fileIndex[0] + ".index");
+                        FileIndex = new IndexInstance(fileIndexPath);
+                    }
+                }
+            }
         }
 
         public async Task Load()
@@ -89,10 +130,10 @@ namespace TACTSharp
             if (!BuildConfig.Values.TryGetValue("root", out var rootKey))
                 throw new Exception("No root key found in build config");
 
-            if (!Encoding.TryGetEKeys(Convert.FromHexString(rootKey[0]), out var rootEKeys) || rootEKeys == null)
+            if (!Encoding.TryFindEntry(Convert.FromHexString(rootKey[0]), out var rootEKeys) || rootEKeys == null)
                 throw new Exception("Root key not found in encoding");
 
-            Root = new (await CDN.GetDecodedFilePath("wow", "data", Convert.ToHexStringLower(rootEKeys.Value.eKeys[0]), 0, rootEKeys.Value.decodedFileSize));
+            Root = new (await CDN.GetDecodedFilePath("wow", "data", Convert.ToHexStringLower(rootEKeys.Value[0]), 0, rootEKeys.Value.DecodedFileSize));
             timer.Stop();
             Console.WriteLine("Root loaded in " + Math.Ceiling(timer.Elapsed.TotalMilliseconds) + "ms");
 
@@ -100,10 +141,10 @@ namespace TACTSharp
             if (!BuildConfig.Values.TryGetValue("install", out var installKey))
                 throw new Exception("No root key found in build config");
 
-            if (!Encoding.TryGetEKeys(Convert.FromHexString(installKey[0]), out var installEKeys) || installEKeys == null)
+            if (!Encoding.TryFindEntry(Convert.FromHexString(installKey[0]), out var installEKeys) || installEKeys == null)
                 throw new Exception("Install key not found in encoding");
 
-            Install = new InstallInstance(await CDN.GetDecodedFilePath("wow", "data", Convert.ToHexStringLower(installEKeys.Value.eKeys[0]), 0, installEKeys.Value.decodedFileSize));
+            Install = new InstallInstance(await CDN.GetDecodedFilePath("wow", "data", Convert.ToHexStringLower(installEKeys.Value[0]), 0, installEKeys.Value.DecodedFileSize));
             timer.Stop();
             Console.WriteLine("Install loaded in " + Math.Ceiling(timer.Elapsed.TotalMilliseconds) + "ms");
         }
@@ -127,14 +168,14 @@ namespace TACTSharp
             if (Encoding == null)
                 throw new Exception("Encoding not loaded");
 
-            var encodingResult = Encoding.GetEKeys(cKey) ?? throw new Exception("File not found in encoding");
+            var encodingResult = Encoding.FindEntry(cKey) ?? throw new Exception("File not found in encoding");
 
-            return OpenFileByEKey(encodingResult.eKeys[0], encodingResult.decodedFileSize);
+            return OpenFileByEKey(encodingResult[0], encodingResult.DecodedFileSize);
         }
 
         public byte[] OpenFileByEKey(string eKey, ulong decodedSize = 0) => OpenFileByEKey(Convert.FromHexString(eKey), decodedSize);
 
-        public byte[] OpenFileByEKey(byte[] eKey, ulong decodedSize = 0)
+        public byte[] OpenFileByEKey(ReadOnlySpan<byte> eKey, ulong decodedSize = 0)
         {
             if (GroupIndex == null || FileIndex == null)
                 throw new Exception("Indexes not loaded");

@@ -1,11 +1,27 @@
 ﻿using System.Collections.Concurrent;
+using System.ComponentModel;
 using System.Diagnostics;
 using System.IO.MemoryMappedFiles;
+using System.Net.NetworkInformation;
 
 namespace TACTSharp
 {
-    public static class CDN
+    public class CDN
     {
+        private readonly string _baseDir;
+        private readonly string _region;
+        private readonly string _product;
+
+        private readonly struct Servers(string[] servers)
+        {
+            public readonly List<string> Entries = [.. servers];
+            public readonly Lock @lock = new();
+        }
+
+        private readonly Servers _servers;
+
+        private readonly Dictionary<byte, CASCIndexInstance> _indexInstances = [];
+
         private static readonly HttpClient Client = new();
         private static readonly List<string> CDNServers = [];
         private static readonly ConcurrentDictionary<string, Lock> FileLocks = [];
@@ -15,51 +31,30 @@ namespace TACTSharp
 
         // TODO: Memory mapped cache file access?
         // TODO: Product is build-specific so that might not be good to have statically in Settings/used below
-        static CDN()
+        public CDN(Settings settings)
         {
-            if (Settings.BaseDir != null)
-            {
-                try
-                {
-                    var localTimer = new Stopwatch();
-                    localTimer.Start();
-                    LoadCASCIndices();
-                    localTimer.Stop();
-                    Console.WriteLine("Loaded local CASC indices in " + Math.Round(localTimer.Elapsed.TotalMilliseconds) + "ms");
-                }
-                catch (Exception e)
-                {
-                    Console.WriteLine("Failed to load CASC indices: " + e.Message);
-                }
-            }
+            _baseDir = settings.BaseDir;
+            _product = settings.Product;
+            _region = settings.Region;
+
+            LoadCASCIndices();
         }
 
-        public static void SetCDNs(string[] cdns)
+        public void SetCDNs(string[] cdns)
         {
-            foreach (var cdn in cdns)
-            {
-                if (!CDNServers.Contains(cdn))
-                {
-                    lock (cdnLock)
-                    {
-                        CDNServers.Add(cdn);
-                    }
-                }
-            }
+            lock (_servers.@lock)
+                _servers.Entries.AddRange(cdns.Where(cdn => !_servers.Entries.Contains(cdn)));
         }
 
-        private static void LoadCDNs()
+        private void LoadCDNs()
         {
             var timer = new Stopwatch();
             timer.Start();
-            var cdnsFile = Client.GetStringAsync($"http://{Settings.Region}.patch.battle.net:1119/{Settings.Product}/cdns").Result;
+            var cdnsFile = Client.GetStringAsync($"http://{_region}.patch.battle.net:1119/{_product}/cdns").Result;
 
             foreach (var line in cdnsFile.Split('\n'))
             {
-                if (line.Length == 0)
-                    continue;
-
-                if (!line.StartsWith(Settings.Region + "|"))
+                if (line.Length == 0 || !line.StartsWith(_region + "|"))
                     continue;
 
                 var splitLine = line.Split('|');
@@ -71,52 +66,49 @@ namespace TACTSharp
 
             CDNServers.Add("archive.wow.tools");
 
-            var pingTasks = new List<Task<(string server, long ping)>>();
-            foreach (var server in CDNServers)
-            {
-                pingTasks.Add(Task.Run(() =>
-                {
-                    var ping = new System.Net.NetworkInformation.Ping().Send(server, 400).RoundtripTime;
-                    Console.WriteLine("Ping to " + server + ": " + ping + "ms");
-                    return (server, 1L);
-                }));
-            }
+            var pingTasks = _servers.Entries.Select(server => Task.Run(() => {
+                    try {
+                        var ping = new Ping().Send(server, 400).RoundtripTime;
+                        return (server, ping);
+                    } catch (Exception ex) {
+                        return (server, -1);
+                    }
+                })).ToArray();
 
-            var pings = Task.WhenAll(pingTasks).Result;
+            var cts = new CancellationTokenSource(1000);
+            Task.WhenEach(pingTasks).ToBlockingEnumerable(cts.Token).OrderBy(pair => pair.ping)
+
+            var pings = Task.WhenAWhll(pingTasks).Result;
 
             CDNServers.AddRange(pings.OrderBy(p => p.ping).Select(p => p.server).ToList());
 
             timer.Stop();
             Console.WriteLine("Pinged " + CDNServers.Count + " in " + Math.Round(timer.Elapsed.TotalMilliseconds) + "ms, fastest CDNs in order: " + string.Join(", ", CDNServers));
         }
-        private static void LoadCASCIndices()
+
+        private void LoadCASCIndices()
         {
-            if (Settings.BaseDir != null)
+            var dataDir = Path.Combine(_baseDir, "Data/data");
+            if (Directory.Exists(dataDir))
             {
-                var dataDir = Path.Combine(Settings.BaseDir, "Data", "data");
-                if (Directory.Exists(dataDir))
+                var indexFiles = Directory.GetFiles(dataDir, "*.idx");
+                foreach (var indexFile in indexFiles)
                 {
-                    var indexFiles = Directory.GetFiles(dataDir, "*.idx");
-                    foreach (var indexFile in indexFiles)
-                    {
-                        if (indexFile.Contains("tempfile"))
-                            continue;
+                    if (indexFile.Contains("tempfile"))
+                        continue;
 
-                        var indexBucket = Convert.FromHexString(Path.GetFileNameWithoutExtension(indexFile)[0..2])[0];
-                        CASCIndexInstances.TryAdd(indexBucket, new CASCIndexInstance(indexFile));
-                    }
-
-                    HasLocal = true;
+                    var indexBucket = Convert.FromHexString(Path.GetFileNameWithoutExtension(indexFile)[0..2])[0];
+                    CASCIndexInstances.TryAdd(indexBucket, new CASCIndexInstance(indexFile));
                 }
+
+                HasLocal = true;
             }
         }
 
-        public static async Task<string> GetProductVersions(string product)
-        {
-            return await Client.GetStringAsync($"https://{Settings.Region}.version.battle.net/{product}/versions");
-        }
+        public async Task<string> GetProductVersions()
+            => await Client.GetStringAsync($"https://{_region}.version.battle.net/{_product}/versions");
 
-        private static async Task<byte[]> DownloadFile(string tprDir, string type, string hash, ulong size = 0, CancellationToken token = new())
+        private async Task<byte[]> DownloadFile(string tprDir, string type, string hash, ulong size = 0, CancellationToken token = new())
         {
             if (HasLocal)
             {
@@ -124,13 +116,13 @@ namespace TACTSharp
                 {
                     if (type == "data" && hash.EndsWith(".index"))
                     {
-                        var localIndexPath = Path.Combine(Settings.BaseDir, "Data", "indices", hash);
+                        var localIndexPath = Path.Combine(_baseDir, "Data/indices", hash);
                         if (File.Exists(localIndexPath))
                             return File.ReadAllBytes(localIndexPath);
                     }
                     else if (type == "config")
                     {
-                        var localConfigPath = Path.Combine(Settings.BaseDir, "Data", "config", hash[0] + "" + hash[1], hash[2] + "" + hash[3], hash);
+                        var localConfigPath = Path.Combine(_baseDir, "Data/config", hash[0] + "" + hash[1], hash[2] + "" + hash[3], hash);
                         if (File.Exists(localConfigPath))
                             return File.ReadAllBytes(localConfigPath);
                     }
@@ -167,13 +159,11 @@ namespace TACTSharp
             }
 
             var success = false;
-            for (var i = 0; i < CDNServers.Count; i++)
+            for (var i = 0; i < _servers.Entries.Count; i++)
             {
                 try
                 {
-                    var url = $"http://{CDNServers[i]}/tpr/{tprDir}/{type}/{hash[0]}{hash[1]}/{hash[2]}{hash[3]}/{hash}";
-
-                    Console.WriteLine("Downloading " + url);
+                    var url = $"http://{_servers.Entries[i]}/tpr/{tprDir}/{type}/{hash[0]}{hash[1]}/{hash[2]}{hash[3]}/{hash}";
 
                     var response = await Client.GetAsync(url, token);
                     if (!response.IsSuccessStatusCode)
@@ -203,18 +193,18 @@ namespace TACTSharp
             return null;
         }
 
-        public static unsafe bool TryGetLocalFile(string eKey, out ReadOnlySpan<byte> data)
+        public unsafe bool TryGetLocalFile(string eKey, out ReadOnlySpan<byte> data)
         {
             var eKeyBytes = Convert.FromHexString(eKey);
             var i = eKeyBytes[0] ^ eKeyBytes[1] ^ eKeyBytes[2] ^ eKeyBytes[3] ^ eKeyBytes[4] ^ eKeyBytes[5] ^ eKeyBytes[6] ^ eKeyBytes[7] ^ eKeyBytes[8];
             var indexBucket = (i & 0xf) ^ (i >> 4);
 
-            var targetIndex = CASCIndexInstances[(byte)indexBucket];
+            var targetIndex = CASCIndexInstances[(byte) indexBucket];
             var (archiveOffset, archiveSize, archiveIndex) = targetIndex.GetIndexInfo(Convert.FromHexString(eKey));
             if (archiveOffset != -1)
             {
                 // We will probably want to cache these but battle.net scares me so I'm not going to do it right now
-                var archivePath = Path.Combine(Settings.BaseDir, "Data", "data", "data." + archiveIndex.ToString().PadLeft(3, '0'));
+                var archivePath = Path.Combine(_baseDir, "Data", "data", "data." + archiveIndex.ToString().PadLeft(3, '0'));
                 var archiveLength = new FileInfo(archivePath).Length;
 
                 using (var archive = MemoryMappedFile.CreateFromFile(archivePath, FileMode.Open, null, 0, MemoryMappedFileAccess.Read))
@@ -252,7 +242,7 @@ namespace TACTSharp
             return false;
         }
 
-        private static async Task<byte[]> DownloadFileFromArchive(string eKey, string tprDir, string archive, int offset, int size, CancellationToken token = new())
+        private async Task<byte[]> DownloadFileFromArchive(string eKey, string tprDir, string archive, int offset, int size, CancellationToken token = new())
         {
             if (HasLocal)
             {

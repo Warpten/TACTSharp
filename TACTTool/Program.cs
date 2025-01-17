@@ -336,13 +336,13 @@ namespace TACTTool
             }
             var cKeyBytes = Convert.FromHexString(cKey);
 
-            if (!build.Encoding.TryGetEKeys(cKeyBytes, out var fileEKeys) || fileEKeys == null)
+            if (!build.Encoding.TryFindEntry(cKeyBytes, out var fileEKeys) || fileEKeys == null)
             {
                 Console.WriteLine("Skipping " + cKey + ", CKey not found in encoding.");
                 return;
             }
 
-            extractionTargets.Add((fileEKeys.Value.eKeys[0], fileEKeys.Value.decodedFileSize, !string.IsNullOrEmpty(filename) ? filename : cKey));
+            extractionTargets.Add((fileEKeys.Value[0].ToArray(), fileEKeys.Value.DecodedFileSize, !string.IsNullOrEmpty(filename) ? filename : cKey));
         }
 
         private static void HandleFDID(BuildInstance build, string fdid, string? filename)
@@ -360,13 +360,15 @@ namespace TACTTool
                 return;
             }
 
-            if (!build.Encoding.TryGetEKeys(fileEntry.ContentKey, out var fileEKeys) || fileEKeys == null)
+            if (!build.Encoding.TryFindEntry(fileEntry.ContentKey, out var fileEKeys) || fileEKeys == null)
             {
                 Console.WriteLine("Skipping FDID " + fdid + ", CKey not found in encoding.");
                 return;
             }
 
-            extractionTargets.Add((fileEKeys.Value.eKeys[0], fileEKeys.Value.decodedFileSize, !string.IsNullOrEmpty(filename) ? filename : fdid));
+            Console.WriteLine(build.Encoding.FindSpec(fileEntry.ContentKey)?.eSpec ?? "None");
+
+            extractionTargets.Add((fileEKeys.Value[0].ToArray(), fileEKeys.Value.DecodedFileSize, !string.IsNullOrEmpty(filename) ? filename : fdid));
         }
 
         private static void HandleFileName(BuildInstance build, string filename, string? outputFilename)
@@ -400,10 +402,10 @@ namespace TACTTool
                 targetCKey = fileEntries[0].md5;
             }
 
-            if (!build.Encoding.TryGetEKeys(targetCKey, out var fileEKeys) || fileEKeys == null)
+            if (!build.Encoding.TryFindEntry(targetCKey, out var fileEKeys) || fileEKeys == null)
                 throw new Exception("EKey not found in encoding");
 
-            extractionTargets.Add((fileEKeys.Value.eKeys[0], fileEKeys.Value.decodedFileSize, !string.IsNullOrEmpty(outputFilename) ? outputFilename : filename));
+            extractionTargets.Add((fileEKeys.Value[0].ToArray(), fileEKeys.Value.DecodedFileSize, !string.IsNullOrEmpty(outputFilename) ? outputFilename : filename));
         }
     }
 }

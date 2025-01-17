@@ -168,7 +168,7 @@ namespace TACTSharp
             return new Enumerator(this);
         }
 
-        unsafe public (int offset, int size, int archiveIndex) GetIndexInfo(Span<byte> eKeyTarget)
+        unsafe public (int offset, int size, int archiveIndex) GetIndexInfo(ReadOnlySpan<byte> eKeyTarget)
         {
             byte* fileData = null;
             try

@@ -7,10 +7,14 @@ using TACTSharp;
 namespace TACTBench
 {
     [MemoryDiagnoser]
-    public class Benchmarks
+    public class SpecificBenchmarks
     {
+        private BuildInstance _build;
+
         [GlobalSetup]
-        public async Task GlobalSetup() {
+        public async Task SpecificSetup() {
+            var settings = new Settings();
+
             var versions = await CDN.GetProductVersions("wow");
             foreach (var line in versions.Split('\n'))
             {
@@ -19,25 +23,24 @@ namespace TACTBench
 
                 var splitLine = line.Split('|');
 
-                Settings.BuildConfig ??= splitLine[1];
-                Settings.CDNConfig ??= splitLine[2];
+                settings.BuildConfig ??= splitLine[1];
+                settings.CDNConfig ??= splitLine[2];
                 break;
             }
-        }
 
-        [Benchmark]
-        public async Task<EncodingInstance.EncodingResult?> BenchmarkFileDataID() {
             var build = new BuildInstance(Settings.BuildConfig!, Settings.CDNConfig!);
             await build.Load();
+        }
 
-            if (build.Encoding == null || build.Root == null || build.Install == null || build.GroupIndex == null)
-                throw new Exception("Failed to load build");
-            
-            ref readonly var fileEntry = ref build.Root.FindFileDataID(1349477);
+        [IterationSetup]
+        public void PrepareBuild() => _build.Encoding!.ClearSpecs();
+
+        [Benchmark]
+        public (string, ulong)? BenchmarkEncodingSpecs() {
+            ref readonly var fileEntry = ref _build.Root!.FindFileDataID(1349477);
             Debug.Assert(!Unsafe.IsNullRef(in fileEntry));
 
-            build.Encoding.TryGetEKeys(fileEntry.ContentKey, out var fileEKeys);
-            return fileEKeys;
+            return _build.Encoding!.FindSpec(fileEntry.ContentKey);
         }
     }
 

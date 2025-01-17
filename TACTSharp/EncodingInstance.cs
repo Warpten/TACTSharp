@@ -1,5 +1,8 @@
 ﻿using Microsoft.Win32.SafeHandles;
 using System.IO.MemoryMappedFiles;
+using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
+using System.Text;
 
 namespace TACTSharp
 {
@@ -8,6 +11,7 @@ namespace TACTSharp
         private readonly MemoryMappedFile encodingFile;
         private readonly MemoryMappedViewAccessor accessor;
         private readonly SafeMemoryMappedViewHandle mmapViewHandle;
+
         private EncodingHeader header;
         private string[] ESpecs = [];
         private readonly Lock ESpecLock = new();
@@ -33,41 +37,45 @@ namespace TACTSharp
         unsafe private EncodingHeader ReadHeader()
         {
             byte* headerData = null;
+            try {
+                mmapViewHandle.AcquirePointer(ref headerData);
 
-            mmapViewHandle.AcquirePointer(ref headerData);
+                var header = new ReadOnlySpan<byte>(headerData, 22);
+                if (header[0] != 0x45 || header[1] != 0x4E)
+                    throw new Exception("Invalid encoding file magic");
 
-            var header = new ReadOnlySpan<byte>(headerData, 22);
-
-            if (header[0] != 0x45 || header[1] != 0x4E)
-                throw new Exception("Invalid encoding file magic");
-
-            return new EncodingHeader
-            {
-                version = header[2],
-                hashSizeCKey = header[3],
-                hashSizeEKey = header[4],
-                CKeyPageSizeKB = (ushort)((header[5] << 8) | header[6]),
-                EKeySpecPageSizeKB = (ushort)((header[7] << 8) | header[8]),
-                CEKeyPageTablePageCount = (uint)((header[9] << 24) | (header[10] << 16) | (header[11] << 8) | header[12]),
-                EKeySpecPageTablePageCount = (uint)((header[13] << 24) | (header[14] << 16) | (header[15] << 8) | header[16]),
-                unk11 = header[17],
-                ESpecBlockSize = (uint)((header[18] << 24) | (header[19] << 16) | (header[20] << 8) | header[21])
-            };
+                return new EncodingHeader
+                {
+                    version = header[2],
+                    hashSizeCKey = header[3],
+                    hashSizeEKey = header[4],
+                    CKeyPageSizeKB = (ushort)((header[5] << 8) | header[6]),
+                    EKeySpecPageSizeKB = (ushort)((header[7] << 8) | header[8]),
+                    CEKeyPageTablePageCount = (uint)((header[9] << 24) | (header[10] << 16) | (header[11] << 8) | header[12]),
+                    EKeySpecPageTablePageCount = (uint)((header[13] << 24) | (header[14] << 16) | (header[15] << 8) | header[16]),
+                    unk11 = header[17],
+                    ESpecBlockSize = (uint)((header[18] << 24) | (header[19] << 16) | (header[20] << 8) | header[21])
+                };
+            } finally {
+                if (headerData != null)
+                    mmapViewHandle.ReleasePointer();
+            }
         }
 
-        unsafe static private byte* LowerBoundEkey(byte* begin, byte* end, long dataSize, ReadOnlySpan<byte> needle)
+        unsafe static private ReadOnlySpan<byte> LowerBoundKey(ReadOnlySpan<byte> data, int stride, ReadOnlySpan<byte> key)
         {
-            var count = (end - begin) / dataSize;
+            var count = data.Length / stride;
+            var begin = 0;
 
             while (count > 0)
             {
                 var it = begin;
                 var step = count / 2;
-                it += step * dataSize;
+                it += step * stride;
 
-                if (new ReadOnlySpan<byte>(it, needle.Length).SequenceCompareTo(needle) <= 0)
+                if (data.Slice(it, key.Length).SequenceCompareTo(key) <= 0)
                 {
-                    it += dataSize;
+                    it += stride;
                     begin = it;
                     count -= step + 1;
                 }
@@ -77,146 +85,141 @@ namespace TACTSharp
                 }
             }
 
-            return begin;
+            return data.Slice(begin, key.Length);
         }
 
-        public bool TryGetEKeys(ReadOnlySpan<byte> cKeyTarget, out EncodingResult? result)
-        {
-            result = GetEKeys(cKeyTarget);
-            return result.HasValue;
-        }
+        public bool TryFindEntry(ReadOnlySpan<byte> cKeyTarget, out Entry? result)
+            => (result = FindEntry(cKeyTarget)) != null;
 
-        public unsafe EncodingResult? GetEKeys(ReadOnlySpan<byte> cKeyTarget)
+        public unsafe Entry? FindEntry(ReadOnlySpan<byte> cKeyTarget)
         {
             byte* pageData = null;
-            mmapViewHandle.AcquirePointer(ref pageData);
+            try {
+                mmapViewHandle.AcquirePointer(ref pageData);
+                if (pageData == null)
+                    return null;
 
-            var eKeyPageSize = header.EKeySpecPageSizeKB * 1024;
+                var eKeyPageSize = header.EKeySpecPageSizeKB * 1024;
+                
+                byte* startOfPageKeys = pageData + 22 + header.ESpecBlockSize;
 
-            byte* startOfPageKeys = pageData + 22 + header.ESpecBlockSize;
-            byte* endOfPageKeys = startOfPageKeys + (header.CEKeyPageTablePageCount * 32);
+                // This span encompasses the page index table.
+                ReadOnlySpan<byte> pageKeys = new(startOfPageKeys, (int) header.CEKeyPageTablePageCount * 32);
+                
+                // Find the last page that doesn't match.
+                ReadOnlySpan<byte> lastPageKey = LowerBoundKey(pageKeys, header.hashSizeCKey + 0x10, cKeyTarget);
+                if (lastPageKey.AsPointer() == startOfPageKeys)
+                    return null;
 
-            byte* lastPageKey = LowerBoundEkey(startOfPageKeys, endOfPageKeys, 32, cKeyTarget);
-            if (lastPageKey == startOfPageKeys)
+                var pageIndex = (lastPageKey.AsPointer() - startOfPageKeys) / (header.hashSizeCKey + 0x10) - 1;
+
+                var itr = new ReadOnlySpan<byte>(startOfPageKeys + pageKeys.Length + pageIndex * eKeyPageSize, eKeyPageSize);
+                while (itr.Length != 0)
+                {
+                    var eKeyCount = itr[0];
+
+                    var itrFileSize = itr.Slice(1, 5);
+                    var itrContentKey = itr.Slice(6, header.hashSizeCKey);
+                    var itrKeys = itr.Slice(6 + header.hashSizeCKey, header.hashSizeEKey * eKeyCount);
+
+                    if (itrContentKey.SequenceEqual(cKeyTarget))
+                        return new Entry(itrKeys.ToArray(), eKeyCount, (ulong) itrFileSize.ReadInt40BE());
+                    
+                    // Skip this entry and move on to the next one
+                    itr = itr[(6 + header.hashSizeCKey + header.hashSizeEKey * eKeyCount) ..];
+                }
+
                 return null;
-
-            var pageIndex = ((lastPageKey - startOfPageKeys) / 32) - 1;
-            var startOfPageEKeys = endOfPageKeys + ((int)pageIndex * eKeyPageSize);
-            var targetPage = new ReadOnlySpan<byte>(startOfPageEKeys, eKeyPageSize);
-            var offs = 0;
-            while (true)
-            {
-                if (offs >= eKeyPageSize)
-                    break;
-
-                var eKeyCount = targetPage[offs];
-                offs++;
-
-                if (eKeyCount == 0)
-                    continue;
-
-                if (targetPage.Slice(offs + 5, header.hashSizeCKey).SequenceEqual(cKeyTarget))
-                {
-                    var decodedFileSize = (ulong)targetPage.Slice(offs, 5).ReadInt40BE();
-                    offs += 5;
-
-                    offs += header.hashSizeCKey; // +ckey
-
-                    var eKeys = new List<byte[]>(eKeyCount);
-                    for (var i = 0; i < eKeyCount; i++)
-                    {
-                        var eKey = new byte[header.hashSizeEKey];
-                        targetPage.Slice(offs, header.hashSizeEKey).CopyTo(eKey);
-                        offs += header.hashSizeEKey;
-                        eKeys.Add(eKey);
-                    }
-
-                    return new EncodingResult()
-                    {
-                        eKeyCount = eKeyCount,
-                        decodedFileSize = decodedFileSize,
-                        eKeys = eKeys
-                    };
-                }
-                else
-                {
-                    offs += 5; //+size
-                    offs += header.hashSizeCKey; // +ckey
-                    offs += header.hashSizeEKey * eKeyCount; // +ekeys
-                }
+            } finally {
+                if (pageData != null)
+                    mmapViewHandle.ReleasePointer();
             }
-
-            return null;
         }
 
-        public unsafe (string eSpec, ulong encodedFileSize)? GetESpec(Span<byte> eKeyTarget)
+        public void ClearSpecs()
         {
-            byte* pageData = null;
-            mmapViewHandle.AcquirePointer(ref pageData);
             lock (ESpecLock)
-            {
-                if (ESpecs.Length == 0)
-                {
-                    var timer = new System.Diagnostics.Stopwatch();
-                    timer.Start();
-                    var eSpecs = new List<string>();
+                ESpecs = [];
+        }
 
-                    var eSpecTable = new ReadOnlySpan<byte>(pageData + 22, (int)header.ESpecBlockSize);
-                    var eSpecOffs = 0;
-                    while (true)
+        public unsafe (string eSpec, ulong encodedFileSize)? FindSpec(ReadOnlySpan<byte> eKeyTarget)
+        {
+            byte* pageData = null;
+            try {
+                mmapViewHandle.AcquirePointer(ref pageData);
+                if (pageData == null)
+                    return null;
+
+                lock (ESpecLock)
+                {
+                    if (ESpecs.Length == 0)
                     {
-                        if (eSpecOffs >= header.ESpecBlockSize)
-                            break;
+                        var timer = new System.Diagnostics.Stopwatch();
+                        timer.Start();
+                        var eSpecs = new List<string>();
 
-                        var eSpecString = eSpecTable[eSpecOffs..].ReadNullTermString();
-                        eSpecOffs += eSpecString.Length + 1;
-                        eSpecs.Add(eSpecString);
+                        var eSpecTable = new ReadOnlySpan<byte>(pageData + 22, (int)header.ESpecBlockSize);
+                        var eSpecOffs = 0;
+                        while (true)
+                        {
+                            if (eSpecOffs >= header.ESpecBlockSize)
+                                break;
+
+                            var eSpecString = eSpecTable[eSpecOffs..].ReadNullTermString();
+                            eSpecOffs += eSpecString.Length + 1;
+                            eSpecs.Add(eSpecString);
+                        }
+
+                        ESpecs = [.. eSpecs];
+
+                        timer.Stop();
+                        Console.WriteLine("Loaded " + ESpecs.Length + " ESpecs in " + timer.Elapsed.TotalMilliseconds + "ms");
                     }
-
-                    ESpecs = [.. eSpecs];
-                    timer.Stop();
-                    Console.WriteLine("Loaded " + ESpecs.Length + " ESpecs in " + timer.Elapsed.TotalMilliseconds + "ms");
                 }
-            }
 
-            var eKeyPageSize = header.EKeySpecPageSizeKB * 1024;
+                var eKeyPageSize = header.EKeySpecPageSizeKB * 1024;
 
-            byte* startOfESpecPageKeys = pageData + 22 + header.ESpecBlockSize + (header.CEKeyPageTablePageCount * 32) + (header.CEKeyPageTablePageCount * (header.CKeyPageSizeKB * 1024));
-            byte* endOfESpecPageKeys = startOfESpecPageKeys + (header.EKeySpecPageTablePageCount * 32);
+                byte* startOfESpecPageKeys = pageData + 22 + header.ESpecBlockSize + (header.CEKeyPageTablePageCount * 32) + (header.CEKeyPageTablePageCount * (header.CKeyPageSizeKB * 1024));
+                byte* endOfESpecPageKeys = startOfESpecPageKeys + (header.EKeySpecPageTablePageCount * 32);
 
-            byte* firstESpecPageKey = LowerBoundEkey(startOfESpecPageKeys, endOfESpecPageKeys, 32, eKeyTarget);
-            if (firstESpecPageKey == startOfESpecPageKeys)
+                var especPageKeys = new ReadOnlySpan<byte>(startOfESpecPageKeys, (int) header.EKeySpecPageTablePageCount * 32);
+
+                byte* firstESpecPageKey = LowerBoundKey(especPageKeys, header.hashSizeEKey + 0x10, eKeyTarget).AsPointer();
+                if (firstESpecPageKey == startOfESpecPageKeys)
+                    return null;
+
+                var pageIndex = ((firstESpecPageKey - startOfESpecPageKeys) / (header.hashSizeEKey + 0x10)) - 1;
+                var startOfPageESpec = endOfESpecPageKeys + ((int)pageIndex * eKeyPageSize);
+                var targetPage = new ReadOnlySpan<byte>(startOfPageESpec, eKeyPageSize);
+                var offs = 0;
+                while (true)
+                {
+                    if (offs >= eKeyPageSize)
+                        break;
+                    if (targetPage.Slice(offs, header.hashSizeEKey).SequenceEqual(eKeyTarget))
+                    {
+                        offs += header.hashSizeEKey; // +ekey
+
+                        var eSpecIndex = targetPage.Slice(offs, 4).ReadInt32BE();
+                        offs += 4;
+
+                        var encodedFileSize = (ulong)targetPage.Slice(offs, 5).ReadInt40BE();
+
+                        return (ESpecs[eSpecIndex], encodedFileSize);
+                    }
+                    else
+                    {
+                        offs += header.hashSizeEKey; // +ekey
+                        offs += 4; // +encodedFileSize
+                        offs += 5; // +encodedFileSize
+                    }
+                }
+
                 return null;
-
-            var pageIndex = ((firstESpecPageKey - startOfESpecPageKeys) / 32) - 1;
-            var startOfPageESpec = endOfESpecPageKeys + ((int)pageIndex * eKeyPageSize);
-            var targetPage = new ReadOnlySpan<byte>(startOfPageESpec, eKeyPageSize);
-            var offs = 0;
-            while (true)
-            {
-                if (offs >= eKeyPageSize)
-                    break;
-
-                if (targetPage.Slice(offs, header.hashSizeEKey).SequenceEqual(eKeyTarget))
-                {
-                    offs += header.hashSizeEKey; // +ekey
-
-                    var eSpecIndex = targetPage.Slice(offs, 4).ReadInt32BE();
-                    offs += 4;
-
-                    var encodedFileSize = (ulong)targetPage.Slice(offs, 5).ReadInt40BE();
-
-                    return (ESpecs[eSpecIndex], encodedFileSize);
-                }
-                else
-                {
-                    offs += header.hashSizeEKey; // +ekey
-                    offs += 4; // +encodedFileSize
-                    offs += 5; // +encodedFileSize
-                }
+            } finally {
+                if (pageData != null)
+                    mmapViewHandle.ReleasePointer();
             }
-
-            return null;
         }
 
         private unsafe struct EncodingHeader
@@ -233,11 +236,20 @@ namespace TACTSharp
             public uint ESpecBlockSize;
         }
 
-        public struct EncodingResult
+        public readonly struct Entry(byte[] keys, byte keyCount, ulong decodedFileSize)
         {
-            public byte eKeyCount;
-            public ulong decodedFileSize;
-            public List<byte[]> eKeys;
+            private readonly byte[] _keys = keys;
+            private readonly byte _keyCount = keyCount;
+
+            private int KeySize => _keys.Length / _keyCount;
+
+            public readonly ulong DecodedFileSize = decodedFileSize;
+
+            public ReadOnlySpan<byte> this[int index] {
+                get => _keys.AsSpan().Slice(index * KeySize, KeySize);
+            }
+
+            public readonly int Length = keyCount;
         }
     }
 }

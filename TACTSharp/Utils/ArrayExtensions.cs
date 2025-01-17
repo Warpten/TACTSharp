@@ -60,8 +60,8 @@ namespace TACTSharp
                 size = right - left;
             }
 
-            Debug.Assert(left < array.Length);
-            return -1;
+            Debug.Assert(left <= array.Length);
+            return left;
         }
     }
 }
