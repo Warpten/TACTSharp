@@ -6,8 +6,6 @@ using System.Linq;
 using System.Text;
 using System.Threading.Tasks;
 
-using static TACTSharp.CDN;
-
 namespace TACTSharp.Instance
 {
 #pragma warning disable CS0660, CS0661
@@ -19,6 +17,8 @@ namespace TACTSharp.Instance
 
         public readonly string Path => _fileInfo.FullName;
         public readonly bool Exists => _fileInfo.Exists;
+
+        internal FileInfo FileInfo => _fileInfo;
 
         internal Resource(FileInfo fileInfo, long offset = 0, long length = 0)
         {

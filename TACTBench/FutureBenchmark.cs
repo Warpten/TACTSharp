@@ -12,7 +12,7 @@ namespace TACTBench
 {
     public class FutureBenchmark
     {
-        private RemoteCache _remoteCache;
+        private RemoteCache? _remoteCache;
 
         [GlobalSetup]
         public void Initialize()
@@ -23,13 +23,9 @@ namespace TACTBench
         [Benchmark] public RemoteCache OpenRemoteCache() => new ("./CACHE", "wow", "eu");
 
         [Benchmark]
-        public (byte[], byte[]) GetVersion()
+        public (string, string) QueryLatestVersions()
         {
-            _remoteCache = new RemoteCache("./CACHE", "wow", "eu");
-            var (build, cdn) = _remoteCache.GetVersion();
-
-            Console.WriteLine(Convert.ToHexStringLower(build));
-            Console.WriteLine(Convert.ToHexStringLower(cdn));
+            var (build, cdn) = _remoteCache!.QueryLatestVersions();
 
             return (build, cdn);
         }

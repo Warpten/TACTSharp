@@ -1,14 +1,18 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Text;
-using System.Threading.Tasks;
-
-namespace TACTSharp.Instance
+﻿namespace TACTSharp.Instance
 {
-    public enum ResourceType
+    public readonly struct ResourceType
     {
-        Config,
-        Data
+        public readonly string RemotePath;
+        public readonly string LocalPath;
+
+        private ResourceType(string remotePath, string localPath)
+        {
+            RemotePath = remotePath;
+            LocalPath = localPath;
+        }
+
+        public static readonly ResourceType Config = new("config", "config");
+        public static readonly ResourceType Data = new ("data", "data");
+        public static readonly ResourceType Indice = new ("data", "indices");
     }
 }

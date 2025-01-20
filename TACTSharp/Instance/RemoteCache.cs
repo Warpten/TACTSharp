@@ -50,35 +50,38 @@ namespace TACTSharp.Instance
             return Stream.Null;
         }
 
-        public Resource OpenResource(ResourceType resourceType, ReadOnlySpan<byte> encodingKey, string fileName, long offset = 0, long length = 0)
+        public Resource OpenResource(ResourceType resourceType, string fileName, long offset = 0, long length = 0)
         {
-            var localPath = Path.Combine(_baseDirectory.FullName, fileName[0..2], fileName[2..4], fileName);
+            var localPath = Path.Combine(_baseDirectory.FullName, resourceType.LocalPath, fileName[0..2], fileName[2..4], fileName);
 
             var fileInfo = new FileInfo(localPath);
             var resource = new Resource(fileInfo, offset, length);
-
-            if (resource.Exists)
-            {
-                var checksum = resource.OpenMemoryMapped(MD5.HashData);
-                if (encodingKey.SequenceEqual(checksum))
-                    return resource;
-
-                fileInfo.Delete();
-                fileInfo.Refresh();
-            }
 
             if (!fileInfo.Exists)
             {
                 fileInfo.Directory!.Create();
 
-                var remotePath = Path.Combine(fileName[0..2], fileName[2..4], fileName);
+                var remotePath = Path.Combine(resourceType.RemotePath, fileName[0..2], fileName[2..4], fileName);
                 using (var fileStream = fileInfo.Create())
                     Download(remotePath).CopyTo(fileStream);
 
                 fileInfo.Refresh();
+            }
 
+            return resource;
+        }
+
+        public Resource OpenResource(ResourceType resourceType, ReadOnlySpan<byte> encodingKey, string fileName, long offset = 0, long length = 0)
+        {
+            var resource = OpenResource(resourceType, fileName, offset, length);
+            if (resource.Exists)
+            {
                 var checksum = resource.OpenMemoryMapped(MD5.HashData);
-                Debug.Assert(encodingKey.SequenceEqual(checksum));
+                if (encodingKey.SequenceEqual(checksum))
+                    return resource;
+                
+                resource.FileInfo.Delete();
+                resource.FileInfo.Refresh();
             }
 
             return resource;
@@ -90,7 +93,7 @@ namespace TACTSharp.Instance
             return OpenResource(resourceType, encodingKey, fileName);
         }
 
-        public (byte[] Build, byte[] CDN) GetVersion()
+        public (string Build, string CDN) QueryLatestVersions()
         {
             var request = new HttpRequestMessage(HttpMethod.Get, $"versions");
             var response = _patchClient.Send(request);
@@ -101,20 +104,20 @@ namespace TACTSharp.Instance
 
                 ReadOnlySpan<byte> dataSpan = new(memoryStream.GetBuffer(), 0, (int)memoryStream.Position);
 
-                return ConfigurationFile<(byte[], byte[])?>.ParseOne(dataSpan, (fields, data) =>
+                return ConfigurationFile<(string, string)?>.ParseOne(dataSpan, (fields, data) =>
                 {
                     var region = Encoding.UTF8.GetString(data[fields[0].Value])!;
                     if (region != _region)
                         return null;
 
-                    var buildConfig = data[fields[1].Value];
-                    var cdnConfig = data[fields[2].Value];
+                    var buildConfig = Encoding.UTF8.GetString(data[fields[1].Value]);
+                    var cdnConfig = Encoding.UTF8.GetString(data[fields[2].Value]);
 
-                    return (buildConfig.ToArray(), cdnConfig.ToArray());
-                }) ?? ([], []);
+                    return (buildConfig, cdnConfig);
+                }) ?? (string.Empty, string.Empty);
             }
 
-            return ([], []);
+            return (string.Empty, string.Empty);
         }
 
         private (Servers, string) InitializeServers()
@@ -140,12 +143,12 @@ namespace TACTSharp.Instance
                     stem = Encoding.UTF8.GetString(data[fields[1].Value]);
                     var servers = Encoding.UTF8.GetString(data[fields[2].Value]);
 
-                    return servers.Split(' ', StringSplitOptions.TrimEntries)
+                    return [.. servers.Split(' ', StringSplitOptions.TrimEntries)
                         .Select(server => new HttpClient() {
                             BaseAddress = new Uri(server.StartsWith("http")
                                 ? $"{server}/{stem}/"
                                 : $"http://{server}/{stem}/")
-                        }).ToArray();
+                        })];
                 }));
             }
 
@@ -182,7 +185,7 @@ namespace TACTSharp.Instance
 
             if (stem != null)
                 sortedServers.Add(new HttpClient() {
-                    BaseAddress = new Uri($"https://archive.wow.tools/{stem}/")
+                    BaseAddress = new Uri($"http://archive.wow.tools/{stem}/")
                 });
 
             return (new Servers([.. sortedServers]), stem ?? "unknown");

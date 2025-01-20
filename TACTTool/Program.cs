@@ -64,9 +64,6 @@ namespace TACTTool
 
         static Program()
         {
-            var remoteCache = new RemoteCache("./CACHE", "wow", "eu");
-            var (build, cdn) = remoteCache.GetVersion();
-
             Product.AddAlias("-p");
 
             BuildConfig.AddValidator(result => {
@@ -81,50 +78,6 @@ namespace TACTTool
             });
         }
 
-        private class BuildInstanceBinder : BinderBase<BuildInstance>
-        {
-            protected override BuildInstance GetBoundValue(BindingContext bindingContext)
-            {
-                var baseDirectory = bindingContext.ParseResult.GetValueForOption(BaseDirectory);
-
-                var settings = new Settings()
-                {
-                    Product = bindingContext.ParseResult.GetValueForOption(Product)!,
-                    Locale = bindingContext.ParseResult.GetValueForOption(Locale)!,
-                    Region = bindingContext.ParseResult.GetValueForOption(Region)!,
-                    CacheDirectory = bindingContext.ParseResult.GetValueForOption(CacheDirectory)!.FullName,
-                    BaseDirectory = baseDirectory?.FullName,
-                };
-
-                var cdn = new CDN(settings);
-
-                var buildConfig = OpenConfiguration(cdn, bindingContext.ParseResult.GetValueForOption(BuildConfig));
-                var cdnConfig = OpenConfiguration(cdn, bindingContext.ParseResult.GetValueForOption(CDNConfig));
-
-                if ((buildConfig == null) != (cdnConfig != null))
-                    throw new InvalidOperationException("Providing either a build or cdn configuration requires the other.");
-
-                if (buildConfig == null && cdnConfig == null)
-                {
-                    var (lhs, rhs) = cdn.QueryVersions(settings) ?? (string.Empty, string.Empty);
-                    buildConfig = OpenConfiguration(cdn, lhs);
-                    cdnConfig = OpenConfiguration(cdn, rhs);
-                }
-
-                if (buildConfig == null) throw new ArgumentNullException(nameof(buildConfig));
-                if (cdnConfig == null) throw new ArgumentNullException(nameof(cdnConfig));
-
-                var configuration = new Configuration(buildConfig, cdnConfig);
-
-                var buildInstance = new BuildInstance(settings, configuration, cdn);
-                if (buildInstance.Encoding == null || buildInstance.Root == null || buildInstance.Install == null || buildInstance.GroupIndex == null)
-                    throw new Exception("Failed to load build");
-
-                bindingContext.AddService(typeof(BuildInstance), provider => buildInstance);
-                return buildInstance;
-            }
-        }
-
         private static BuildInstance Open(InvocationContext invocationContext)
         {
             var settings = new Settings()
@@ -136,26 +89,26 @@ namespace TACTTool
                 BaseDirectory = invocationContext.ParseResult.GetValueForOption(BaseDirectory)?.FullName,
             };
 
-            var cdn = new CDN(settings);
+            var resourceManager = new ResourceManager(settings);
 
-            var buildConfig = OpenConfiguration(cdn, invocationContext.ParseResult.GetValueForOption(BuildConfig));
-            var cdnConfig = OpenConfiguration(cdn, invocationContext.ParseResult.GetValueForOption(CDNConfig));
+            var buildConfig = OpenConfiguration(resourceManager, invocationContext.ParseResult.GetValueForOption(BuildConfig));
+            var cdnConfig = OpenConfiguration(resourceManager, invocationContext.ParseResult.GetValueForOption(CDNConfig));
 
             if ((buildConfig == null) != (cdnConfig == null))
                 throw new InvalidOperationException("Providing either a build or cdn configuration requires the other.");
 
             if (buildConfig == null && cdnConfig == null)
             {
-                var (lhs, rhs) = cdn.QueryVersions(settings) ?? (string.Empty, string.Empty);
-                buildConfig = OpenConfiguration(cdn, lhs);
-                cdnConfig = OpenConfiguration(cdn, rhs);
+                var (lhs, rhs) = resourceManager.Remote.QueryLatestVersions();
+                buildConfig = OpenConfiguration(resourceManager, lhs);
+                cdnConfig = OpenConfiguration(resourceManager, rhs);
             }
 
             if (buildConfig == null) throw new ArgumentNullException(nameof(buildConfig));
             if (cdnConfig == null) throw new ArgumentNullException(nameof(cdnConfig));
 
             var configuration = new Configuration(buildConfig, cdnConfig);
-            return new BuildInstance(settings, configuration, cdn);
+            return new BuildInstance(settings, configuration, resourceManager);
         }
 
         public static void Main(string[] args)
@@ -304,7 +257,7 @@ namespace TACTTool
         private static byte[] HandleEncodingKey(BuildInstance buildInstance, ReadOnlySpan<byte> encodingKey)
             => buildInstance.OpenFileByEKey(encodingKey);
 
-        private static Config? OpenConfiguration(CDN cdn, string? input)
+        private static Config? OpenConfiguration(ResourceManager resourceManager, string? input)
         {
             if (string.IsNullOrEmpty(input))
                 return null;
@@ -318,7 +271,7 @@ namespace TACTTool
                 try
                 {
                     if (input.AsSpan().StartsWith("hash:"))
-                        return Config.FromHash(cdn, Convert.FromHexString(input.AsSpan()[5..]));
+                        return Config.FromHash(resourceManager, Convert.FromHexString(input.AsSpan()[5..]));
                 }
                 catch (Exception)
                 {
@@ -331,7 +284,7 @@ namespace TACTTool
                 try
                 {
                     var configKey = Convert.FromHexString(input);
-                    return Config.FromHash(cdn, configKey);
+                    return Config.FromHash(resourceManager, configKey);
                 }
                 catch (FormatException)
                 {

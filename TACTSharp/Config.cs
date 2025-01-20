@@ -1,4 +1,5 @@
 ﻿using System.Text;
+using TACTSharp.Instance;
 
 namespace TACTSharp
 {
@@ -8,14 +9,14 @@ namespace TACTSharp
         {
             var fileInfo = new FileInfo(filePath);
             if (fileInfo.Exists)
-                return FromResource(new Resource(filePath, 0, fileInfo.Length));
+                return FromResource(new Resource(fileInfo));
 
             return null;
         }
 
-        public static Config? FromHash(CDN cdn, string hash)
+        public static Config? FromHash(ResourceManager resourceManager, string hash)
         {
-            var resource = cdn.OpenOrDownload(CDN.FileType.Config, hash, 0);
+            var resource = resourceManager.Resolve(ResourceType.Config, hash);
             return FromResource(resource);
         }
 
@@ -32,16 +33,16 @@ namespace TACTSharp
         /// <param name="cdn"></param>
         /// <param name="hash"></param>
         /// <returns></returns>
-        public static Config? FromHash(CDN cdn, ReadOnlySpan<byte> hash)
+        public static Config? FromHash(ResourceManager resourceManager, ReadOnlySpan<byte> hash)
         {
-            var resource = cdn.OpenOrDownload(CDN.FileType.Config, hash, 0);
+            var resource = resourceManager.Resolve(ResourceType.Config, hash);
             return FromResource(resource);
         }
 
         public static Config? FromResource(Resource resource)
         {
             if (resource.Exists)
-                return resource.OpenMap(data => new Config(data));
+                return resource.OpenMemoryMapped(data => new Config(data));
 
             return null;
         }
@@ -50,7 +51,7 @@ namespace TACTSharp
         {
             var fileInfo = new FileInfo(filePath);
             if (fileInfo.Exists)
-                return FromResource(new Resource(fileInfo.FullName, 0, fileInfo.Length));
+                return FromResource(new Resource(fileInfo));
 
             return null;
         }

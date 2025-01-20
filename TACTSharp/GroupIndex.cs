@@ -1,6 +1,7 @@
 ﻿using System.Buffers.Binary;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
+using TACTSharp.Instance;
 
 namespace TACTSharp
 {
@@ -15,7 +16,7 @@ namespace TACTSharp
             public uint Offset;
         }
 
-        public static Resource Generate(string? hash, string[] archives, Settings settings, CDN cdn)
+        public static Resource Generate(string? hash, string[] archives, Settings settings, ResourceManager resourceManager)
         {
             var entries = new List<IndexEntry>();
             
@@ -28,7 +29,7 @@ namespace TACTSharp
                 options,
                 () => new List<IndexEntry>(),
                 (itr, parallelLoopState, indexEntries) => {
-                    var resource = cdn.OpenOrDownload(CDN.FileType.Index, itr.Archive + ".index", 0);
+                    var resource = resourceManager.Resolve(ResourceType.Data, itr.Archive + ".index");
                     if (!resource.Exists)
                         return indexEntries;
 
@@ -86,15 +87,24 @@ namespace TACTSharp
                     bin.BaseStream.Position = startOfBlock;
 
                     var blockEntries = i + 1 == outputNumBlocks
-                        ? entriesSpan.Slice(i * outputEntriesPerBlock)
+                        ? entriesSpan[(i * outputEntriesPerBlock) ..]
                         : entriesSpan.Slice(i * outputEntriesPerBlock, outputEntriesPerBlock);
 
                     foreach (ref var entry in blockEntries)
                     {
                         bin.Write(entry.EKey);
-                        bin.Write(BinaryPrimitives.ReverseEndianness(entry.Size));
-                        bin.Write(BinaryPrimitives.ReverseEndianness(entry.ArchiveIndex));
-                        bin.Write(BinaryPrimitives.ReverseEndianness(entry.Offset));
+                        if (BitConverter.IsLittleEndian)
+                        {
+                            bin.Write(BinaryPrimitives.ReverseEndianness(entry.Size));
+                            bin.Write(BinaryPrimitives.ReverseEndianness(entry.ArchiveIndex));
+                            bin.Write(BinaryPrimitives.ReverseEndianness(entry.Offset));
+                        }
+                        else
+                        {
+                            bin.Write(entry.Size);
+                            bin.Write(entry.ArchiveIndex);
+                            bin.Write(entry.Offset);
+                        }
                     }
                     
                     bin.BaseStream.Position = ofsStartOfTocEkeys + i * outputFooter.keyBytes;
@@ -113,7 +123,10 @@ namespace TACTSharp
                 bin.Write(outputFooter.sizeBytes);
                 bin.Write(outputFooter.keyBytes);
                 bin.Write(outputFooter.hashBytes);
-                bin.Write(outputFooter.numElements);
+                if (BitConverter.IsLittleEndian)
+                    bin.Write(outputFooter.numElements);
+                else
+                    bin.Write(BinaryPrimitives.ReverseEndianness(outputFooter.numElements));
                 bin.Write(new byte[outputFooter.hashBytes]); // footerHash
 
                 for (var i = 0; i < outputNumBlocks; i++)
@@ -160,7 +173,7 @@ namespace TACTSharp
                 }
 
                 File.WriteAllBytes(filePath, ms.GetBuffer().AsSpan()[.. (int) ms.Position]);
-                return new Resource(filePath, 0, ms.Position);
+                return new Resource(new FileInfo(filePath));
             }
         }
 
