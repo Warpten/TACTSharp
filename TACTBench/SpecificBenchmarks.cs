@@ -8,7 +8,7 @@ namespace TACTBench
 {
     [MemoryDiagnoser]
     public class SpecificBenchmarks
-    {
+    {/*
         private BuildInstance _build;
 
         [GlobalSetup]
@@ -41,7 +41,7 @@ namespace TACTBench
             Debug.Assert(!Unsafe.IsNullRef(in fileEntry));
 
             return _build.Encoding!.FindSpec(fileEntry.ContentKey);
-        }
+        }*/
     }
 
 }

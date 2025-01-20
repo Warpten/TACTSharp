@@ -92,7 +92,7 @@ namespace TACTSharp
             }
         }
 
-        private unsafe class Enumerator : IEnumerable<Entry>, IEnumerator<Entry> {
+        public unsafe class IndexEntryEnumerator {
             private byte* rawData;
 
             // Block iteration
@@ -103,7 +103,7 @@ namespace TACTSharp
 
             private IndexInstance index;
             
-            public Enumerator(IndexInstance index)
+            public IndexEntryEnumerator(IndexInstance index)
             {
                 this.index = index;
                 this.index.mmapViewHandle.AcquirePointer(ref this.rawData);
@@ -122,8 +122,6 @@ namespace TACTSharp
                 // Debug.Assert(size != 0);
                 return new Entry(eKey, offset, size);
             }
-
-            object IEnumerator.Current => throw new InvalidOperationException();
 
             public bool MoveNext() {
                 // Someone optimize this to eliminate branches as much as possible
@@ -153,8 +151,7 @@ namespace TACTSharp
                 this.blockIndex = 0;
             }
 
-            public IEnumerator<Entry> GetEnumerator() => this;
-            IEnumerator IEnumerable.GetEnumerator() => this;
+            public IndexEntryEnumerator GetEnumerator() => this;
 
             public void Dispose() {
                 if (this.rawData != null)
@@ -164,8 +161,8 @@ namespace TACTSharp
             }
         }
 
-        public IEnumerable<Entry> Enumerate() {
-            return new Enumerator(this);
+        public IndexEntryEnumerator Enumerate() {
+            return new IndexEntryEnumerator(this);
         }
 
         unsafe public (int offset, int size, int archiveIndex) GetIndexInfo(ReadOnlySpan<byte> eKeyTarget)

@@ -1,4 +1,5 @@
 ﻿using System.Buffers.Binary;
+using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 
 namespace TACTSharp
@@ -14,56 +15,42 @@ namespace TACTSharp
             public uint Offset;
         }
 
-        private static readonly List<IndexEntry> Entries = [];
-
-        public static string Generate(string? hash, string[] archives)
+        public static Resource Generate(string? hash, string[] archives, Settings settings, CDN cdn)
         {
-            if (string.IsNullOrEmpty(hash))
-                Console.WriteLine("Generating group index for unknown group-index");
-            else
-                Console.WriteLine("Generating group index for " + hash);
+            var entries = new List<IndexEntry>();
+            
+            var accumulationLock = new Lock();
 
-            Console.WriteLine("Loading " + archives.Length + " index files");
-
-            Lock accumulationLock = new();
+            var options = new ParallelOptions { MaxDegreeOfParallelism = -1 };
             Parallel.ForEach(
                 Enumerable.Range(0, archives.Length)
-                    .Select(archiveIndex => (archive: archives[archiveIndex], idx: (short) archiveIndex)),
+                    .Select(archiveIndex => (Archive: archives[archiveIndex], Index: (short) archiveIndex)),
+                options,
                 () => new List<IndexEntry>(),
-                (itr, state, subtotal) => {
-                    string indexPath = "";
-                    if (!string.IsNullOrEmpty(Settings.BaseDir) && File.Exists(Path.Combine(Settings.BaseDir, "Data", "indices", itr.archive + ".index")))
-                    {
-                        indexPath = Path.Combine(Settings.BaseDir, "Data", "indices", itr.archive + ".index");
-                    }
-                    else
-                    {
-                        _ = CDN.GetFile("wow", "data", itr.archive + ".index").Result;
-                        indexPath = Path.Combine("cache", "wow", "data", itr.archive + ".index");
-                    }
+                (itr, parallelLoopState, indexEntries) => {
+                    var resource = cdn.OpenOrDownload(CDN.FileType.Index, itr.Archive + ".index", 0);
+                    if (!resource.Exists)
+                        return indexEntries;
 
-                    var index = new IndexInstance(indexPath, itr.idx);
+                    var index = new IndexInstance(resource.Path, itr.Index);
                     foreach (var (eKey, offset, size) in index.Enumerate()) {
-                        subtotal.Add(new IndexEntry {
+                        indexEntries.Add(new IndexEntry {
                             EKey = eKey.ToArray(),
                             Size = (uint) size,
                             Offset = (uint) offset,
-                            ArchiveIndex = (ushort) itr.idx
+                            ArchiveIndex = (ushort) itr.Index
                         });
                     }
 
-                    return subtotal;
+                    return indexEntries;
                 },
-                subtotal => {
+                indexEntries => {
                     lock (accumulationLock)
-                        Entries.AddRange(subtotal);
+                        entries.AddRange(indexEntries);
                 });
 
-            Console.WriteLine("Done loading index files, got " + Entries.Count + " entries");
-
-            Console.WriteLine("Sorting entries by EKey");
-            Entries.Sort((a, b) => a.EKey.AsSpan().SequenceCompareTo(b.EKey));
-            Console.WriteLine("Done sorting entries");
+            entries.Sort((a, b) => a.EKey.AsSpan().SequenceCompareTo(b.EKey));
+            var entriesSpan = CollectionsMarshal.AsSpan(entries);
 
             var outputFooter = new IndexFooter
             {
@@ -75,7 +62,7 @@ namespace TACTSharp
                 sizeBytes = 4,
                 keyBytes = 16,
                 hashBytes = 8,
-                numElements = (uint)Entries.Count
+                numElements = (uint) entriesSpan.Length
             };
 
             var outputBlockSizeBytes = outputFooter.blockSizeKBytes << 10;
@@ -98,17 +85,20 @@ namespace TACTSharp
                     var startOfBlock = i * outputBlockSizeBytes;
                     bin.BaseStream.Position = startOfBlock;
 
-                    var blockEntries = Entries.Skip(i * outputEntriesPerBlock).Take(outputEntriesPerBlock).ToArray();
-                    for (var j = 0; j < blockEntries.Length; j++)
+                    var blockEntries = i + 1 == outputNumBlocks
+                        ? entriesSpan.Slice(i * outputEntriesPerBlock)
+                        : entriesSpan.Slice(i * outputEntriesPerBlock, outputEntriesPerBlock);
+
+                    foreach (ref var entry in blockEntries)
                     {
-                        var entry = blockEntries[j];
                         bin.Write(entry.EKey);
                         bin.Write(BinaryPrimitives.ReverseEndianness(entry.Size));
-                        bin.Write(BinaryPrimitives.ReverseEndianness((short)entry.ArchiveIndex));
+                        bin.Write(BinaryPrimitives.ReverseEndianness(entry.ArchiveIndex));
                         bin.Write(BinaryPrimitives.ReverseEndianness(entry.Offset));
                     }
+                    
                     bin.BaseStream.Position = ofsStartOfTocEkeys + i * outputFooter.keyBytes;
-                    bin.Write(blockEntries.Last().EKey);
+                    bin.Write(blockEntries[^1].EKey);
                     bin.BaseStream.Position = ofsStartOfTocBlockHashes + i * outputFooter.hashBytes;
                     bin.Write(new byte[outputFooter.hashBytes]);
                 }
@@ -156,22 +146,21 @@ namespace TACTSharp
                 var fullFooterBytes = br.ReadBytes(28);
                 var fullFooterMD5Hash = Convert.ToHexStringLower(MD5.HashData(fullFooterBytes));
 
-                Directory.CreateDirectory(Path.Combine("cache", "wow", "data"));
+                var filePath = Path.Combine(settings.CacheDirectory, settings.Product, hash + ".index");
+                Directory.CreateDirectory(Path.GetDirectoryName(filePath)!);
 
                 if (!string.IsNullOrEmpty(hash))
                 {
                     if (fullFooterMD5Hash != hash)
                         throw new Exception($"Footer MD5 of group index does not match group index filename; found {fullFooterMD5Hash}");
-
-                    File.WriteAllBytes(Path.Combine("cache", "wow", "data", hash + ".index"), ms.ToArray());
                 }
                 else
                 {
                     hash = fullFooterMD5Hash;
-                    File.WriteAllBytes(Path.Combine("cache", "wow", "data", fullFooterMD5Hash + ".index"), ms.ToArray());
                 }
 
-                return hash;
+                File.WriteAllBytes(filePath, ms.GetBuffer().AsSpan()[.. (int) ms.Position]);
+                return new Resource(filePath, 0, ms.Position);
             }
         }
 

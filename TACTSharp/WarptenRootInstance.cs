@@ -57,18 +57,8 @@ namespace TACTSharp
             NoCompression = 0x80000000  // sounds have this flag
         }
 
-        public unsafe WarptenRoot(string filePath)
+        public WarptenRoot(ReadOnlySpan<byte> fileData, Settings settings)
         {
-            var rootFile = MemoryMappedFile.CreateFromFile(filePath, FileMode.Open, null, 0, MemoryMappedFileAccess.Read);
-            var accessor = rootFile.CreateViewAccessor(0, 0, MemoryMappedFileAccess.Read);
-            var mmapViewHandle = accessor.SafeMemoryMappedViewHandle;
-
-            byte* rawData = null;
-            mmapViewHandle.AcquirePointer(ref rawData);
-
-            var fileSize = new FileInfo(filePath).Length;
-            var fileData = new ReadOnlySpan<byte>(rawData, (int) fileSize);
-
             var magic = fileData.ReadUInt32LE();
             var (format, version, headerSize, totalFileCount, namedFileCount) = magic switch {
                 0x4D465354 => ParseMFST(fileData),
@@ -90,7 +80,7 @@ namespace TACTSharp
                     continue;
 
                 // Determine conditions related to keeping this page.
-                var localeSkip = !pageHeader.HasFlag(LocaleFlags.All_WoW) && !pageHeader.HasFlag(Settings.Locale);
+                var localeSkip = !pageHeader.HasFlag(LocaleFlags.All_WoW) && !pageHeader.HasFlag(settings.Locale);
                 var contentSkip = pageHeader.HasFlag(ContentFlags.LowViolence);
 
                 // Calculate block size

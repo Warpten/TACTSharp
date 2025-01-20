@@ -64,7 +64,7 @@ namespace TACTSharp
 
                 Initialize(key, iv);
                 m_rounds = rounds;
-                m_state = null;
+                m_state = [];
             }
 
             public bool CanReuseTransform { get; } = false;
@@ -87,7 +87,7 @@ namespace TACTSharp
                     throw new ArgumentNullException(nameof(outputBuffer));
                 if (outputOffset < 0 || outputOffset + inputCount > outputBuffer.Length)
                     throw new ArgumentOutOfRangeException(nameof(outputOffset));
-                if (m_state == null)
+                if (m_state.Length == 0)
                     throw new ObjectDisposedException(GetType().Name);
 
                 byte[] output = new byte[64];
@@ -128,9 +128,8 @@ namespace TACTSharp
 
             public void Dispose()
             {
-                if (m_state != null)
-                    Array.Clear(m_state, 0, m_state.Length);
-                m_state = null;
+                Array.Clear(m_state, 0, m_state.Length);
+                m_state = [];
             }
 
             private static uint Rotate(uint v, int c)

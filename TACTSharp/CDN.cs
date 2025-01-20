@@ -1,373 +1,484 @@
 ﻿using System.Collections.Concurrent;
 using System.ComponentModel;
 using System.Diagnostics;
+using System.Drawing;
+using System.IO;
 using System.IO.MemoryMappedFiles;
+using System.Net;
+using System.Net.Http.Headers;
 using System.Net.NetworkInformation;
+using System.Reflection;
 
 namespace TACTSharp
 {
-    public class CDN
+    public sealed class CDN
     {
-        private readonly string _baseDir;
+        public enum FileType
+        {
+            Config,
+            Index,
+            Data
+        }
+        private static string[] FILE_TYPES = ["config", "data", "data"];
+
+        public delegate T Parser<T>(ReadOnlySpan<byte> data);
+
+        private readonly string? _baseDirectory;
+        private readonly string _cacheDirectory;
         private readonly string _region;
         private readonly string _product;
 
-        private readonly struct Servers(string[] servers)
+        private readonly struct Servers(HttpClient[] clients, string stem)
         {
-            public readonly List<string> Entries = [.. servers];
+            public readonly List<HttpClient> Clients = [.. clients];
+            public readonly string Stem = stem;
             public readonly Lock @lock = new();
         }
 
-        private readonly Servers _servers;
+        private Servers _servers;
+        private readonly HttpClient _patchClient;
 
-        private readonly Dictionary<byte, CASCIndexInstance> _indexInstances = [];
+        private readonly CASCIndexInstance[] _localIndices;
 
-        private static readonly HttpClient Client = new();
-        private static readonly List<string> CDNServers = [];
-        private static readonly ConcurrentDictionary<string, Lock> FileLocks = [];
+        private static readonly ConcurrentDictionary<string, Lock> _fileLocks = [];
         private static readonly Lock cdnLock = new();
-        private static bool HasLocal = false;
-        private static readonly Dictionary<byte, CASCIndexInstance> CASCIndexInstances = [];
 
         // TODO: Memory mapped cache file access?
         // TODO: Product is build-specific so that might not be good to have statically in Settings/used below
         public CDN(Settings settings)
         {
-            _baseDir = settings.BaseDir;
+            _baseDirectory = settings.BaseDirectory;
+            _cacheDirectory = settings.CacheDirectory;
+
             _product = settings.Product;
             _region = settings.Region;
 
-            LoadCASCIndices();
+            _patchClient = new HttpClient() {
+                BaseAddress = new Uri($"http://{_region}.patch.battle.net:1119/"),
+            };
+
+            _servers = LoadServers();
+            _localIndices = LoadLocalIndices();
         }
 
-        public void SetCDNs(string[] cdns)
+        public (string BuildConfig, string CDNConfig)? QueryVersions(Settings settings)
         {
-            lock (_servers.@lock)
-                _servers.Entries.AddRange(cdns.Where(cdn => !_servers.Entries.Contains(cdn)));
-        }
+            var response = _patchClient.Send(new HttpRequestMessage(HttpMethod.Get, $"/{_product}/versions"));
+            if (!response.IsSuccessStatusCode)
+                return null;
 
-        private void LoadCDNs()
-        {
-            var timer = new Stopwatch();
-            timer.Start();
-            var cdnsFile = Client.GetStringAsync($"http://{_region}.patch.battle.net:1119/{_product}/cdns").Result;
+            using var reader = new StreamReader(response.Content.ReadAsStream());
 
-            foreach (var line in cdnsFile.Split('\n'))
+            string? line;
+            while ((line = reader.ReadLine()) != null)
             {
-                if (line.Length == 0 || !line.StartsWith(_region + "|"))
-                    continue;
-
-                var splitLine = line.Split('|');
-                if (splitLine.Length < 2)
-                    continue;
-
-                CDNServers.AddRange(splitLine[2].Trim().Split(' '));
+                if (line.AsSpan().StartsWith(settings.Region) && line[settings.Region.Length] == '|')
+                {
+                    var ranges = GC.AllocateUninitializedArray<Range>(4);
+                    var tokenCount = line.AsSpan().Split(ranges, '|', StringSplitOptions.RemoveEmptyEntries);
+                    if (tokenCount >= 3)
+                        return (line[ranges[1]], line[ranges[2]]);
+                }
             }
 
-            CDNServers.Add("archive.wow.tools");
-
-            var pingTasks = _servers.Entries.Select(server => Task.Run(() => {
-                    try {
-                        var ping = new Ping().Send(server, 400).RoundtripTime;
-                        return (server, ping);
-                    } catch (Exception ex) {
-                        return (server, -1);
-                    }
-                })).ToArray();
-
-            var cts = new CancellationTokenSource(1000);
-            Task.WhenEach(pingTasks).ToBlockingEnumerable(cts.Token).OrderBy(pair => pair.ping)
-
-            var pings = Task.WhenAWhll(pingTasks).Result;
-
-            CDNServers.AddRange(pings.OrderBy(p => p.ping).Select(p => p.server).ToList());
-
-            timer.Stop();
-            Console.WriteLine("Pinged " + CDNServers.Count + " in " + Math.Round(timer.Elapsed.TotalMilliseconds) + "ms, fastest CDNs in order: " + string.Join(", ", CDNServers));
+            return null;
         }
 
-        private void LoadCASCIndices()
+        private Servers LoadServers()
         {
-            var dataDir = Path.Combine(_baseDir, "Data/data");
-            if (Directory.Exists(dataDir))
+            var servers = new List<HttpClient>();
+            var stem = $"/tpr/{_product}"; // By default
+
+            var request = new HttpRequestMessage(HttpMethod.Get, $"/{_product}/cdns");
+            var response = _patchClient.Send(request);
+            if (response.IsSuccessStatusCode)
             {
-                var indexFiles = Directory.GetFiles(dataDir, "*.idx");
-                foreach (var indexFile in indexFiles)
+                using var reader = new StreamReader(response.Content.ReadAsStream());
+
+                string? line = null;
+                while ((line = reader.ReadLine()) != null)
                 {
-                    if (indexFile.Contains("tempfile"))
+                    // Name|Path|Hosts|Servers|ConfigPath
+                    if (line.Length == 0)
                         continue;
 
-                    var indexBucket = Convert.FromHexString(Path.GetFileNameWithoutExtension(indexFile)[0..2])[0];
-                    CASCIndexInstances.TryAdd(indexBucket, new CASCIndexInstance(indexFile));
-                }
+                    var lineSpan = line.AsSpan();
 
-                HasLocal = true;
+                    // Collect at most 3 ranges, we don't need more.
+                    var tokenRanges = GC.AllocateUninitializedArray<Range>(4);
+                    var lineTokens = lineSpan.Split(tokenRanges, '|', StringSplitOptions.TrimEntries);
+
+                    // If less than 3 tokens found, or if region does not match, continue to next line.
+                    if (lineTokens < 3 || !lineSpan[tokenRanges[0]].SequenceEqual(_region))
+                        continue;
+
+                    // Register clients
+                    stem = lineSpan[tokenRanges[1]].ToString();
+                    var serverNames = lineSpan[tokenRanges[2]];
+                    foreach (var serverNameRange in serverNames.SplitAny(' '))
+                    {
+                        var serverName = serverNames[serverNameRange];
+
+                        var httpClient = new HttpClient()
+                        {
+                            BaseAddress = serverName.StartsWith("http://") || serverName.StartsWith("https://")
+                                ? new Uri(serverName.ToString())
+                                : new Uri($"https://{serverName}/")
+                        };
+                        servers.Add(httpClient);
+                    }
+                    break;
+                }
             }
+
+            // Kakapos unite
+            servers.Add(new HttpClient() {
+                BaseAddress = new Uri($"https://archive.wow.tools/")
+            });
+
+            // Create ping tasks for each client.
+            var pingTasks = servers.Select(server => Task.Run(async () => {
+                try 
+                {
+                    var response = await new Ping().SendPingAsync(server.BaseAddress!.Host, 400);
+
+                    return (Server: server, Ping: response.RoundtripTime);
+                }
+                catch (Exception)
+                {
+                    return (Server: server, Ping: long.MaxValue);
+                }
+            })).ToArray();
+
+            // Add a 1s overall timeout and collect all pings, sorting and mapping to the actual clients.
+            // Servers that exceed the total timeout will be the last to be used.
+            var cts = new CancellationTokenSource(1000);
+            return new Servers(Task.WhenEach(pingTasks)
+                .ToBlockingEnumerable(cts.Token)
+                .Select(task => task.Result)
+                .Where(pingInfo => pingInfo.Ping != long.MaxValue)
+                .OrderBy(pingInfo => pingInfo.Ping)
+                .Select(pingInfo => pingInfo.Server)
+                .ToArray(), stem!);
         }
 
-        public async Task<string> GetProductVersions()
-            => await Client.GetStringAsync($"https://{_region}.version.battle.net/{_product}/versions");
-
-        private async Task<byte[]> DownloadFile(string tprDir, string type, string hash, ulong size = 0, CancellationToken token = new())
+        private CASCIndexInstance[] LoadLocalIndices()
         {
-            if (HasLocal)
+            if (_baseDirectory == null)
+                return [];
+
+            var dataDir = Path.Combine(_baseDirectory, "Data/data");
+            if (!Directory.Exists(dataDir))
+                return [];
+
+            var indexFiles = Directory.GetFiles(dataDir, "*.idx");
+            var indices = new CASCIndexInstance[indexFiles.Length];
+
+            foreach (var indexFile in indexFiles)
             {
-                try
-                {
-                    if (type == "data" && hash.EndsWith(".index"))
-                    {
-                        var localIndexPath = Path.Combine(_baseDir, "Data/indices", hash);
-                        if (File.Exists(localIndexPath))
-                            return File.ReadAllBytes(localIndexPath);
-                    }
-                    else if (type == "config")
-                    {
-                        var localConfigPath = Path.Combine(_baseDir, "Data/config", hash[0] + "" + hash[1], hash[2] + "" + hash[3], hash);
-                        if (File.Exists(localConfigPath))
-                            return File.ReadAllBytes(localConfigPath);
-                    }
-                    else
-                    {
-                        if (TryGetLocalFile(hash, out var data))
-                            return data.ToArray();
-                    }
-                }
-                catch (Exception e)
-                {
-                    Console.WriteLine("Failed to read local file: " + e.Message);
-                }
-            }
-
-            var cachePath = Path.Combine("cache", tprDir, type, hash);
-            FileLocks.TryAdd(cachePath, new Lock());
-
-            if (File.Exists(cachePath))
-            {
-                if (size > 0 && (ulong)new FileInfo(cachePath).Length != size)
-                    File.Delete(cachePath);
-                else
-                    lock (FileLocks[cachePath])
-                        return File.ReadAllBytes(cachePath);
-            }
-
-            lock (cdnLock)
-            {
-                if (CDNServers.Count == 0)
-                {
-                    LoadCDNs();
-                }
-            }
-
-            var success = false;
-            for (var i = 0; i < _servers.Entries.Count; i++)
-            {
-                try
-                {
-                    var url = $"http://{_servers.Entries[i]}/tpr/{tprDir}/{type}/{hash[0]}{hash[1]}/{hash[2]}{hash[3]}/{hash}";
-
-                    var response = await Client.GetAsync(url, token);
-                    if (!response.IsSuccessStatusCode)
-                        throw new Exception("Encountered HTTP " + response.StatusCode + " downloading " + hash + " from " + CDNServers[i]);
-
-                    var data = await response.Content.ReadAsByteArrayAsync(token);
-
-                    Directory.CreateDirectory(Path.GetDirectoryName(cachePath)!);
-
-                    lock (FileLocks[cachePath])
-                        File.WriteAllBytes(cachePath, data);
-
-                    success = true;
-
-                    return data;
-                }
-                catch (Exception e)
-                {
-                    Console.WriteLine("Failed to download: " + e.Message);
+                if (indexFile.Contains("tempfile"))
                     continue;
-                }
+
+                // Consider avoiding this allocation as well and just using backwards indexing to find the bucket marker.
+                var fileName = Path.GetFileNameWithoutExtension(indexFile);
+
+                var indexBucket = Convert.FromHexString(fileName.AsSpan()[0..2])[0];
+                indices[indexBucket] = new CASCIndexInstance(indexFile);
             }
 
-            if (!success)
-                throw new FileNotFoundException("Exhausted all CDNs trying to download " + hash);
-
-            return null;
+            return indices;
         }
 
-        public unsafe bool TryGetLocalFile(string eKey, out ReadOnlySpan<byte> data)
+        /// <summary>
+        /// Synchronously opens a network stream to the specific file. Returns an empty stream if
+        /// the file could not be found on any CDN.
+        /// </summary>
+        /// <param name="fileName">The name of the file to open.</param>
+        /// <param name="expectedLength">The expected size of the file. A size of zero disables size checks.</param>
+        /// <returns>A stream over the network resource, or an empty stream if the file could not be found.</returns>
+        public Stream OpenRemote(FileType fileType, string fileName, long expectedLength = 0)
         {
-            var eKeyBytes = Convert.FromHexString(eKey);
-            var i = eKeyBytes[0] ^ eKeyBytes[1] ^ eKeyBytes[2] ^ eKeyBytes[3] ^ eKeyBytes[4] ^ eKeyBytes[5] ^ eKeyBytes[6] ^ eKeyBytes[7] ^ eKeyBytes[8];
-            var indexBucket = (i & 0xf) ^ (i >> 4);
+            var requestUri = $"/{_servers.Stem}/{FILE_TYPES[(int) fileType]}/{fileName[0..2]}/{fileName[2..4]}/{fileName}";
 
-            var targetIndex = CASCIndexInstances[(byte) indexBucket];
-            var (archiveOffset, archiveSize, archiveIndex) = targetIndex.GetIndexInfo(Convert.FromHexString(eKey));
-            if (archiveOffset != -1)
+            for (var i = 0; i < _servers.Clients.Count; ++i)
             {
-                // We will probably want to cache these but battle.net scares me so I'm not going to do it right now
-                var archivePath = Path.Combine(_baseDir, "Data", "data", "data." + archiveIndex.ToString().PadLeft(3, '0'));
-                var archiveLength = new FileInfo(archivePath).Length;
+                var client = _servers.Clients[i];
 
-                using (var archive = MemoryMappedFile.CreateFromFile(archivePath, FileMode.Open, null, 0, MemoryMappedFileAccess.Read))
-                using (var accessor = archive.CreateViewAccessor(0, 0, MemoryMappedFileAccess.Read))
-                using (var mmapViewHandle = accessor.SafeMemoryMappedViewHandle)
+                try
                 {
-                    byte* ptr = null;
-                    try
-                    {
-                        mmapViewHandle.AcquirePointer(ref ptr);
+                    HttpResponseMessage? httpResponse;
 
-                        if (archiveOffset + archiveSize > archiveLength)
+                    // Send a HEAD request to check resource size, but ignore status code 405.
+                    if (expectedLength != 0)
+                    {
+                        var headRequest = new HttpRequestMessage(HttpMethod.Head, requestUri);
+                        httpResponse = client.Send(headRequest);
+                        if (!httpResponse!.IsSuccessStatusCode)
                         {
-                            Console.WriteLine("Skipping local file read: " + archiveOffset + " + " + archiveSize + " > " + archiveLength + " for archive " + "data." + archiveIndex.ToString().PadLeft(3, '0'));
-                            data = null;
-                            return false;
+                            if (httpResponse.StatusCode != HttpStatusCode.MethodNotAllowed
+                                && httpResponse.Content.Headers.ContentLength != expectedLength)
+                                continue;
                         }
+                        else if (httpResponse!.Content.Headers.ContentLength != expectedLength)
+                            continue;
+                    }
 
-                        data = new ReadOnlySpan<byte>(ptr + archiveOffset, archiveSize).ToArray();
-                        return true;
-                    }
-                    catch (Exception e)
-                    {
-                        Console.WriteLine("Failed to read local file: " + e.Message);
-                        data = null;
-                        return false;
-                    }
-                    finally
-                    {
-                        mmapViewHandle.ReleasePointer();
-                    }
+                    var getRequest = new HttpRequestMessage(HttpMethod.Get, requestUri);
+                    httpResponse = client.Send(getRequest);
+                    if (!httpResponse!.IsSuccessStatusCode)
+                        continue;
+
+                    if (expectedLength != 0 && httpResponse.Content.Headers.ContentLength != expectedLength)
+                        continue;
+
+                    return httpResponse!.Content.ReadAsStream();
+                }
+                catch (Exception)
+                {
+
                 }
             }
-            data = null;
-            return false;
+
+            return Stream.Null;
         }
 
-        private async Task<byte[]> DownloadFileFromArchive(string eKey, string tprDir, string archive, int offset, int size, CancellationToken token = new())
+        /// <summary>
+        /// Asynchronously opens a network stream to the specific file. Returns an empty stream if
+        /// the file could not be found on any CDN.
+        /// </summary>
+        /// <param name="fileName">The name of the file to open.</param>
+        /// <param name="expectedLength">The expected size of the file.</param>
+        /// <returns>A stream over the network resource, or an empty stream if the file could not be found.</returns>
+        public async Task<Stream> OpenRemoteAsync(FileType fileType, string fileName, long expectedLength = 0)
         {
-            if (HasLocal)
+            var requestUri = $"/{_servers.Stem}/{FILE_TYPES[(int)fileType]}/{fileName[0..2]}/{fileName[2..4]}/{fileName}";
+            var request = new HttpRequestMessage(HttpMethod.Get, requestUri);
+
+            for (var i = 0; i < _servers.Clients.Count; ++i)
             {
+                var client = _servers.Clients[i];
+
                 try
                 {
-                    if (TryGetLocalFile(eKey, out var data))
-                        return data.ToArray();
-                }
-                catch (Exception e)
-                {
-                    Console.WriteLine("Failed to read local file: " + e.Message);
-                }
-            }
+                    HttpResponseMessage? httpResponse;
 
-            var cachePath = Path.Combine("cache", tprDir, "data", eKey);
-            FileLocks.TryAdd(cachePath, new Lock());
-
-            if (File.Exists(cachePath))
-            {
-                if (new FileInfo(cachePath).Length == size)
-                    lock (FileLocks[cachePath])
-                        return File.ReadAllBytes(cachePath);
-                else
-                    File.Delete(cachePath);
-            }
-
-            lock (cdnLock)
-            {
-                if (CDNServers.Count == 0)
-                {
-                    LoadCDNs();
-                }
-            }
-
-            var success = false;
-            for (var i = 0; i < CDNServers.Count; i++)
-            {
-                try
-                {
-                    var url = $"http://{CDNServers[i]}/tpr/{tprDir}/data/{archive[0]}{archive[1]}/{archive[2]}{archive[3]}/{archive}";
-
-                    Console.WriteLine("Downloading file " + eKey + " from archive " + archive + " at offset " + offset + " with size " + size);
-
-                    var request = new HttpRequestMessage(HttpMethod.Get, url)
+                    // Send a HEAD request to check resource size, but ignore status code 405.
+                    if (expectedLength != 0)
                     {
-                        Headers =
+                        request.Method = HttpMethod.Head;
+                        httpResponse = await client.SendAsync(request);
+                        if (!httpResponse!.IsSuccessStatusCode)
                         {
-                            Range = new System.Net.Http.Headers.RangeHeaderValue(offset, offset + size - 1)
+                            if (httpResponse.StatusCode != HttpStatusCode.MethodNotAllowed
+                                && httpResponse.Content.Headers.ContentLength != expectedLength)
+                                continue;
                         }
+                        else if (httpResponse!.Content.Headers.ContentLength != expectedLength)
+                            continue;
+                    }
+
+                    request.Method = HttpMethod.Get;
+                    httpResponse = await client.SendAsync(request);
+                    if (!httpResponse!.IsSuccessStatusCode)
+                        continue;
+                    
+                    if (expectedLength != 0 && httpResponse.Content.Headers.ContentLength != expectedLength)
+                        continue;
+
+                    return await httpResponse.Content.ReadAsStreamAsync();
+                }
+                catch (Exception)
+                {
+
+                }
+            }
+
+            return Stream.Null;
+        }
+
+        /// <summary>
+        /// Attempts to obtain a file from the locally installed CASC file system.
+        /// </summary>
+        /// <param name="encodingKey">The encoding key of the file to look for.?</param>
+        /// <param name="data">A buffer to be written to containing the data read from the file.</param>
+        /// <returns></returns>
+        public unsafe Resource OpenLocalFile(ReadOnlySpan<byte> encodingKey)
+        {
+            if (_localIndices.Length != 0 && _baseDirectory != null)
+            {
+                // Identify bucket.
+                var indexBucket = encodingKey[0];
+                for (var i = 1; i < encodingKey.Length / 2 + 1; ++i)
+                    indexBucket ^= encodingKey[i];
+
+                indexBucket = (byte)((indexBucket & 0xF) ^ (indexBucket >> 4));
+
+                var targetIndex = _localIndices[indexBucket];
+                var (archiveOffset, archiveSize, archiveIndex) = targetIndex.GetIndexInfo(encodingKey);
+
+                if (archiveOffset != -1)
+                {
+                    // We will probably want to cache these but battle.net scares me so I'm not going to do it right now
+                    var archivePath = Path.Combine(_baseDirectory, "Data/data", "data." + archiveIndex.ToString().PadLeft(3, '0'));
+
+                    return new Resource(archivePath, archiveOffset, archiveSize);
+                }
+            }
+
+            return Resource.Empty;
+        }
+
+        /// <summary>
+        /// Opens or downloads a file given its encoding key.
+        /// 
+        /// <list type="number">
+        ///     <item>The local game installation, if available.</item>
+        ///     <item>The local cache directory, if available.</item>
+        ///     <item>Any CDN server.</item>
+        /// </list>
+        /// </summary>
+        /// <param name="fileType">The type of the file.</param>
+        /// <param name="encodingKey">The file's encoding key.</param>
+        /// <param name="expectedLength">The file's expected size.</param>
+        /// <returns></returns>
+        public Resource OpenOrDownload(FileType fileType, ReadOnlySpan<byte> encodingKey, long expectedLength)
+        {
+            var resource = OpenLocalFile(encodingKey);
+            if (resource.Exists)
+                return resource;
+
+            return OpenOrDownload(fileType, Convert.ToHexStringLower(encodingKey), expectedLength);
+        }
+
+        /// <summary>
+        /// Opens or downloads a file.
+        /// 
+        /// <list type="number">
+        ///     <item>The local cache directory, if available.</item>
+        ///     <item>Any CDN server.</item>
+        /// </list>
+        /// </summary>
+        /// <param name="fileType">The type of this file.</param>
+        /// <param name="fileName">The name of the file being looked for.</param>
+        /// <param name="expectedLength">The expected size of the file.</param>
+        /// <returns></returns>
+        public Resource OpenOrDownload(FileType fileType, string fileName, long expectedLength)
+        {
+            var localResource = LocateCachedResource("tpr", _product, FILE_TYPES[(int) fileType], fileName);
+            if (expectedLength == 0 ? localResource.Length != 0 : localResource.Length == expectedLength)
+                return localResource;
+
+            var fileInfo = new FileInfo(localResource.Path);
+            lock (_fileLocks.GetOrAdd(localResource.Path, _ => new()))
+            {
+                if (!fileInfo.Exists)
+                {
+                    Directory.CreateDirectory(fileInfo.DirectoryName!);
+                    var stream = OpenRemote(fileType, fileName, expectedLength);
+
+                    using var fileStream = fileInfo.Create();
+                    stream.CopyTo(fileStream);
+
+                    fileInfo.Refresh();
+                }
+
+                if (!fileInfo.Exists)
+                    return Resource.Empty;
+
+                if (expectedLength != 0 && fileInfo.Length != expectedLength)
+                {
+                    fileInfo.Delete();
+                    return Resource.Empty;
+                }
+            }
+
+            return new Resource(localResource.Path, 0, (int) fileInfo.Length);
+        }
+
+        /// <summary>
+        /// Obtains a <see cref="Resource"/> to a file available in the local cache.
+        /// </summary>
+        /// <param name="pathParameters"></param>
+        /// <returns></returns>
+        public Resource LocateCachedResource(params ReadOnlySpan<string> pathParameters)
+        {
+            var fileInfo = new FileInfo(Path.Combine([_cacheDirectory, .. pathParameters]));
+            return new Resource(fileInfo.FullName, 0, fileInfo.Exists ? fileInfo.Length : 0);
+        }
+
+        /// <summary>
+        /// Obtains a <see cref="Resource"/> to a file available in the game's base directory.
+        /// 
+        /// If this class was configured without such a directory specified, systematically returns
+        /// <see cref="Resource.Empty"/>.
+        /// </summary>
+        /// <param name="pathParameters"></param>
+        /// <returns></returns>
+        public Resource LocateLocalResource(params ReadOnlySpan<string> pathParameters)
+        {
+            var fileInfo = new FileInfo(Path.Combine([_baseDirectory ?? "kakapos/united", .. pathParameters]));
+            return new Resource(fileInfo.FullName, 0, fileInfo.Exists ? fileInfo.Length : 0);
+        }
+
+        /// <summary>
+        /// Opens or downloads a file from an archive.
+        /// </summary>
+        /// <param name="encodingKey">An encoding key identifying the file.</param>
+        /// <param name="archiveKey">Identifies the archive containing the file.</param>
+        /// <param name="fileOffset">The offset at which this file is located.</param>
+        /// <param name="fileSize">The (compressed) size of this file within the archive.</param>
+        /// <returns>A stream to the file on disk, or an empty stream if the file could not be found.</returns>
+        public Resource OpenOrDownload(ReadOnlySpan<byte> encodingKey, ReadOnlySpan<byte> archiveKey, FileType fileType, int fileOffset, int fileSize)
+        {
+            var resource = OpenLocalFile(encodingKey);
+            if (resource.Exists && resource.Length == fileSize)
+                return resource;
+
+            var localFileName = Convert.ToHexStringLower(encodingKey);
+            var archiveName = Convert.ToHexStringLower(archiveKey);
+
+            var localFile = LocateCachedResource("tpr", _product, FILE_TYPES[(int) fileType], localFileName);
+            if (localFile.Length == fileSize)
+                return localFile;
+
+            lock (_fileLocks.GetOrAdd(localFile.Path, _ => new()))
+            {
+                var fileInfo = new FileInfo(localFile.Path);
+                if (!fileInfo.Exists)
+                {
+                    Directory.CreateDirectory(fileInfo.DirectoryName!);
+
+                    var requestUri = $"/{_servers.Stem}/{FILE_TYPES[(int)fileType]}/{archiveName[0..2]}/{archiveName[2..4]}/{archiveName}";
+                    var request = new HttpRequestMessage(HttpMethod.Get, requestUri)
+                    {
+                        Headers = { Range = new RangeHeaderValue(fileOffset, fileOffset + fileSize - 1) }
                     };
 
-                    var response = await Client.SendAsync(request, token);
+                    lock (_servers.@lock)
+                    {
+                        for (var i = 0; i < _servers.Clients.Count; ++i)
+                        {
+                            var client = _servers.Clients[i];
 
-                    if (!response.IsSuccessStatusCode)
-                        throw new Exception("Encountered HTTP " + response.StatusCode + " downloading " + eKey + " (archive " + archive + ") from " + CDNServers[i]);
+                            var response = client.Send(request);
+                            if (response == null)
+                                continue;
 
-                    var data = await response.Content.ReadAsByteArrayAsync(token);
-                    Directory.CreateDirectory(Path.GetDirectoryName(cachePath)!);
+                            using var fileStream = fileInfo.Create();
+                            response.Content.CopyTo(fileStream, null, CancellationToken.None);
+                            break;
+                        }
+                    }
 
-                    lock (FileLocks[cachePath])
-                        File.WriteAllBytes(cachePath, data);
-                    return data;
+                    fileInfo.Refresh();
                 }
-                catch (Exception e)
-                {
-                    Console.WriteLine("Failed to download: " + e.Message);
-                    continue;
-                }
+
+                if (!fileInfo.Exists)
+                    return Resource.Empty;
+
+                Debug.Assert(fileInfo.Length == fileSize);
+                return new Resource(localFileName, 0, fileSize);
             }
-
-            if (!success)
-                throw new FileNotFoundException("Exhausted all CDNs trying to download " + eKey + " (archive " + archive + ")");
-
-            return null;
-        }
-
-        public static async Task<byte[]> GetFile(string tprDir, string type, string hash, ulong compressedSize = 0, ulong decompressedSize = 0, bool decoded = false, CancellationToken token = new())
-        {
-            var data = await DownloadFile(tprDir, type, hash, compressedSize, token);
-            if (!decoded)
-                return data;
-            else
-                return BLTE.Decode(data, decompressedSize);
-        }
-
-        public static async Task<byte[]> GetFileFromArchive(string eKey, string tprDir, string archive, int offset, int length, ulong decompressedSize = 0, bool decoded = false, CancellationToken token = new())
-        {
-            var data = await DownloadFileFromArchive(eKey, tprDir, archive, offset, length, token);
-            if (!decoded)
-                return data;
-            else
-                return BLTE.Decode(data, decompressedSize);
-        }
-
-        public static async Task<string> GetFilePath(string tprDir, string type, string hash, ulong compressedSize = 0, CancellationToken token = new())
-        {
-            var cachePath = Path.Combine("cache", tprDir, type, hash);
-            if (File.Exists(cachePath))
-                return cachePath;
-
-            var data = await DownloadFile(tprDir, type, hash, compressedSize, token);
-            Directory.CreateDirectory(Path.GetDirectoryName(cachePath)!);
-
-            FileLocks.TryAdd(cachePath, new Lock());
-            lock (FileLocks[cachePath])
-                File.WriteAllBytes(cachePath, data);
-
-            return cachePath;
-        }
-
-        public static async Task<string> GetDecodedFilePath(string tprDir, string type, string hash, ulong compressedSize = 0, ulong decompressedSize = 0, CancellationToken token = new())
-        {
-            var cachePath = Path.Combine("cache", tprDir, type, hash + ".decoded");
-            if (File.Exists(cachePath))
-                return cachePath;
-
-            var data = await DownloadFile(tprDir, type, hash, compressedSize, token);
-            var decodedData = BLTE.Decode(data, decompressedSize);
-            Directory.CreateDirectory(Path.GetDirectoryName(cachePath)!);
-
-            FileLocks.TryAdd(cachePath, new Lock());
-            lock (FileLocks[cachePath])
-                File.WriteAllBytes(cachePath, decodedData);
-
-            return cachePath;
         }
     }
 }

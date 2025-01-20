@@ -1,386 +1,282 @@
-﻿using System.Collections.Concurrent;
-using System.CommandLine;
+﻿using System.CommandLine;
+using System.CommandLine.Binding;
 using System.CommandLine.Invocation;
-using System.Diagnostics;
 using System.Runtime.CompilerServices;
-using System.Runtime.InteropServices;
+
 using TACTSharp;
-using static TACTSharp.RootInstance;
+using TACTSharp.Instance;
+
+using static TACTSharp.WarptenRoot;
 
 namespace TACTTool
 {
     internal class Program
     {
-        private enum InputMode
+        private static Option<string> BuildConfig = new(
+            name: "--buildConfig",
+            description: "A hexadecimal string identifying the build configuration to load, or the path to a file on disk."
+        );
+        private static Option<string> CDNConfig = new(
+            name: "--cdnConfig",
+            description: "A hexadecimal string identifying the CDN configuration to load, or the path to a file on disk."
+        );
+        private static Option<string> Product = new(
+            name: "--product",
+            description: "The TACT product code that should be loaded."
+        );
+        private static Option<string> Region = new(
+            name: "--region",
+            description: "The region to use for patch service, build selection, and CDNs.",
+            getDefaultValue: () => "us"
+        );
+        private static Option<LocaleFlags> Locale = new(
+            name: "--locale",
+            description: "The locale to use during file extraction.",
+            getDefaultValue: () => LocaleFlags.enUS
+        );
+        private static Option<FileSystemInfo> Destination = new(
+            name: "--output"
+        );
+        private static Option<DirectoryInfo> CacheDirectory = new(
+            name: "--cacheDirectory",
+            description: "A path on disk that will be used as a cache for files downloaded by this tool.",
+            getDefaultValue: () => new DirectoryInfo("./cache")
+        );
+        private static Option<DirectoryInfo> BaseDirectory = new(
+            name: "--baseDirectory",
+            description: "A path to an installation of WoW to use as source for build informations and local read-only cache."
+        );
+
+        private static bool ValidateConfigurationIdentifier(string? identifier)
         {
-            List,
-            EKey,
-            CKey,
-            FDID,
-            FileName
-        };
+            if (string.IsNullOrEmpty(identifier))
+                return false;
 
-        private static InputMode? Mode;
-        private static string? Input;
-        private static string? Output;
-        private static readonly ConcurrentBag<(byte[] eKey, ulong decodedSize, string fileName)> extractionTargets = [];
+            return new FileInfo(identifier).Exists || (identifier.Length == 32 && identifier.All(c =>
+            {
+                if (c >= '0' && c <= '9')
+                    return true;
 
-        static async Task Main(string[] args)
+                c = (char)(c & ~0b0100_0000);
+                return c >= 'a' && c <= 'f';
+            }));
+        }
+
+        static Program()
         {
-            #region CLI switches
-            var rootCommand = new RootCommand("TACTTool - Extraction tool using the TACTSharp library");
+            var remoteCache = new RemoteCache("./CACHE", "wow", "eu");
+            var (build, cdn) = remoteCache.GetVersion();
 
-            var buildConfigOption = new Option<string?>(name: "--buildconfig", description: "Build config to load (hex or file on disk)");
-            buildConfigOption.AddAlias("-b");
-            rootCommand.AddOption(buildConfigOption);
+            Product.AddAlias("-p");
 
-            var cdnConfigOption = new Option<string?>(name: "--cdnconfig", description: "CDN config to load (hex or file on disk)");
-            cdnConfigOption.AddAlias("-c");
-            rootCommand.AddOption(cdnConfigOption);
+            BuildConfig.AddValidator(result => {
+                var value = result.GetValueForOption(BuildConfig);
+                if (!ValidateConfigurationIdentifier(value))
+                    result.ErrorMessage = "The provided value is neither a valid file path nor a valid hex-encoded 16-bytes string.";
+            });
+            CDNConfig.AddValidator(result => {
+                var value = result.GetValueForOption(BuildConfig);
+                if (!ValidateConfigurationIdentifier(value))
+                    result.ErrorMessage = "The provided value is neither a valid file path nor a valid hex-encoded 16-bytes string.";
+            });
+        }
 
-            var productOption = new Option<string?>(name: "--product", () => Settings.Product, description: "TACT product to load");
-            productOption.AddAlias("-p");
-            rootCommand.AddOption(productOption);
-
-            var regionOption = new Option<string?>(name: "--region", () => Settings.Region, description: "Region to use for patch service/build selection/CDNs");
-            regionOption.AddAlias("-r");
-            rootCommand.AddOption(regionOption);
-
-            var localeOption = new Option<string?>(name: "--locale", () => "enUS", description: "Locale to use for file retrieval");
-            localeOption.AddAlias("-l");
-            rootCommand.AddOption(localeOption);
-
-            var inputModeOption = new Option<string>("--mode", "Input mode: list, ekey (or ehash), ckey (or chash), id (or fdid), name (or filename)");
-            inputModeOption.AddAlias("-m");
-            rootCommand.AddOption(inputModeOption);
-
-            var inputValueOption = new Option<string>("--inputvalue", "Input value for extraction");
-            inputValueOption.AddAlias("-i");
-            rootCommand.AddOption(inputValueOption);
-
-            var outputDirOption = new Option<string>("--output", "Output path for extracted files, folder for list mode (defaults to 'extract' folder), output filename for other input modes (defaults to input value as filename)");
-            outputDirOption.AddAlias("-o");
-            rootCommand.AddOption(outputDirOption);
-
-            var baseDirOption = new Option<string?>(name: "--basedir", description: "WoW installation folder to use as source for build info and read-only file cache (if available)");
-            baseDirOption.AddAlias("-d");
-            rootCommand.AddOption(baseDirOption);
-
-            rootCommand.SetHandler(CommandLineArgHandler);
-
-            await rootCommand.InvokeAsync(args);
-
-            if (Settings.BuildConfig == null || Settings.CDNConfig == null)
+        private class BuildInstanceBinder : BinderBase<BuildInstance>
+        {
+            protected override BuildInstance GetBoundValue(BindingContext bindingContext)
             {
-                Console.WriteLine("Missing build or CDN config, exiting..");
-                return;
-            }
-            #endregion
+                var baseDirectory = bindingContext.ParseResult.GetValueForOption(BaseDirectory);
 
-            if (Input == null)
-            {
-                Console.WriteLine("No input given, skipping extraction..");
-                return;
-            }
-
-            var buildTimer = new Stopwatch();
-            var totalTimer = new Stopwatch();
-            totalTimer.Start();
-
-            buildTimer.Start();
-            var build = new BuildInstance(Settings.BuildConfig, Settings.CDNConfig);
-            await build.Load();
-            buildTimer.Stop();
-            Console.WriteLine("Build " + build.BuildConfig.Values["build-name"][0] + " loaded in " + Math.Ceiling(buildTimer.Elapsed.TotalMilliseconds) + "ms");
-
-            if (build.Encoding == null || build.Root == null || build.Install == null || build.GroupIndex == null)
-                throw new Exception("Failed to load build");
-
-            // Handle input modes
-            switch (Mode)
-            {
-                case InputMode.List:
-                    HandleList(build, Input);
-                    break;
-                case InputMode.EKey:
-                    HandleEKey(Input, Output);
-                    break;
-                case InputMode.CKey:
-                    HandleCKey(build, Input, Output);
-                    break;
-                case InputMode.FDID:
-                    HandleFDID(build, Input, Output);
-                    break;
-                case InputMode.FileName:
-                    HandleFileName(build, Input, Output);
-                    break;
-            }
-
-            if (extractionTargets.IsEmpty)
-            {
-                Console.WriteLine("No files to extract, exiting..");
-                return;
-            }
-
-            Console.WriteLine("Extracting " + extractionTargets.Count + " file" + (extractionTargets.Count > 1 ? "s" : "") + "..");
-
-            Parallel.ForEach(extractionTargets, target =>
-            {
-                var (eKey, decodedSize, fileName) = target;
-
-                Console.WriteLine("Extracting " + Convert.ToHexStringLower(eKey) + " to " + fileName);
-
-                try
+                var settings = new Settings()
                 {
-                    var fileBytes = build.OpenFileByEKey(eKey, decodedSize);
+                    Product = bindingContext.ParseResult.GetValueForOption(Product)!,
+                    Locale = bindingContext.ParseResult.GetValueForOption(Locale)!,
+                    Region = bindingContext.ParseResult.GetValueForOption(Region)!,
+                    CacheDirectory = bindingContext.ParseResult.GetValueForOption(CacheDirectory)!.FullName,
+                    BaseDirectory = baseDirectory?.FullName,
+                };
 
-                    if (Mode == InputMode.List)
-                    {
-                        Directory.CreateDirectory(Path.Combine(Output, Path.GetDirectoryName(fileName)!));
-                        File.WriteAllBytes(Path.Combine(Output, fileName), fileBytes);
-                    }
-                    else
-                    {
-                        var dirName = Path.GetDirectoryName(fileName);
-                        if (!string.IsNullOrEmpty(dirName))
-                            Directory.CreateDirectory(dirName);
+                var cdn = new CDN(settings);
 
-                        File.WriteAllBytes(fileName, fileBytes);
-                    }
+                var buildConfig = OpenConfiguration(cdn, bindingContext.ParseResult.GetValueForOption(BuildConfig));
+                var cdnConfig = OpenConfiguration(cdn, bindingContext.ParseResult.GetValueForOption(CDNConfig));
+
+                if ((buildConfig == null) != (cdnConfig != null))
+                    throw new InvalidOperationException("Providing either a build or cdn configuration requires the other.");
+
+                if (buildConfig == null && cdnConfig == null)
+                {
+                    var (lhs, rhs) = cdn.QueryVersions(settings) ?? (string.Empty, string.Empty);
+                    buildConfig = OpenConfiguration(cdn, lhs);
+                    cdnConfig = OpenConfiguration(cdn, rhs);
                 }
-                catch (Exception e)
-                {
-                    Console.WriteLine("Failed to extract " + fileName + " (" + Convert.ToHexStringLower(eKey) + "): " + e.Message);
+
+                if (buildConfig == null) throw new ArgumentNullException(nameof(buildConfig));
+                if (cdnConfig == null) throw new ArgumentNullException(nameof(cdnConfig));
+
+                var configuration = new Configuration(buildConfig, cdnConfig);
+
+                var buildInstance = new BuildInstance(settings, configuration, cdn);
+                if (buildInstance.Encoding == null || buildInstance.Root == null || buildInstance.Install == null || buildInstance.GroupIndex == null)
+                    throw new Exception("Failed to load build");
+
+                bindingContext.AddService(typeof(BuildInstance), provider => buildInstance);
+                return buildInstance;
+            }
+        }
+
+        private static BuildInstance Open(InvocationContext invocationContext)
+        {
+            var settings = new Settings()
+            {
+                Product = invocationContext.ParseResult.GetValueForOption(Product)!,
+                Locale = invocationContext.ParseResult.GetValueForOption(Locale)!,
+                Region = invocationContext.ParseResult.GetValueForOption(Region)!,
+                CacheDirectory = invocationContext.ParseResult.GetValueForOption(CacheDirectory)!.FullName,
+                BaseDirectory = invocationContext.ParseResult.GetValueForOption(BaseDirectory)?.FullName,
+            };
+
+            var cdn = new CDN(settings);
+
+            var buildConfig = OpenConfiguration(cdn, invocationContext.ParseResult.GetValueForOption(BuildConfig));
+            var cdnConfig = OpenConfiguration(cdn, invocationContext.ParseResult.GetValueForOption(CDNConfig));
+
+            if ((buildConfig == null) != (cdnConfig == null))
+                throw new InvalidOperationException("Providing either a build or cdn configuration requires the other.");
+
+            if (buildConfig == null && cdnConfig == null)
+            {
+                var (lhs, rhs) = cdn.QueryVersions(settings) ?? (string.Empty, string.Empty);
+                buildConfig = OpenConfiguration(cdn, lhs);
+                cdnConfig = OpenConfiguration(cdn, rhs);
+            }
+
+            if (buildConfig == null) throw new ArgumentNullException(nameof(buildConfig));
+            if (cdnConfig == null) throw new ArgumentNullException(nameof(cdnConfig));
+
+            var configuration = new Configuration(buildConfig, cdnConfig);
+            return new BuildInstance(settings, configuration, cdn);
+        }
+
+        public static void Main(string[] args)
+        {
+            var root = new RootCommand();
+            root.AddGlobalOptions(BuildConfig, CDNConfig, Product, Region, Locale, CacheDirectory, BaseDirectory);
+
+            var fileDataCommand = new Command("extractFileDataID", "Extracts a file given its file data ID.");
+            var fileDataArg = new Argument<uint>("fileDataID");
+            fileDataCommand.AddArgument(fileDataArg);
+            fileDataCommand.SetHandler(context =>
+            {
+                var buildInstance = Open(context);
+                var fileDataID = context.ParseResult.GetValueForArgument(fileDataArg);
+                var destination = context.ParseResult.GetValueForOption(Destination);
+
+                var fileData = HandleFileDataID(buildInstance, fileDataID);
+            });
+
+            var contentKeyCommand = new Command("extractContentKey", "Extracts a file given its content key.");
+            var contentKeyArg = new Argument<string>("contentKey");
+            contentKeyCommand.AddAlias("ckey");
+            contentKeyCommand.AddAlias("chash");
+            contentKeyCommand.AddArgument(contentKeyArg);
+            contentKeyCommand.SetHandler(context =>
+            {
+                var buildInstance = Open(context);
+                var contentKeyStr = context.ParseResult.GetValueForArgument(contentKeyArg);
+                var destination = context.ParseResult.GetValueForOption(Destination);
+
+                var contentKey = Convert.FromHexString(contentKeyStr);
+
+                if (!buildInstance.Encoding.TryFindEntry(contentKey, out var fileEKeys) || fileEKeys == null)
                     return;
-                }
+
+                var fileData = HandleContentKey(buildInstance, contentKey);
             });
 
-            totalTimer.Stop();
-            Console.WriteLine("Total time: " + totalTimer.Elapsed.TotalMilliseconds + "ms");
-        }
-
-        private static async Task CommandLineArgHandler(InvocationContext context)
-        {
-            var command = context.ParseResult.CommandResult;
-            var modeOption = command.Command.Options.FirstOrDefault(option => option.Name == "mode");
-            foreach (var option in command.Command.Options)
+            var encodingKeyCommand = new Command("extractEncodingKey", "Extractsd a file given its encoding key.");
+            var encodingKeyArg = new Argument<string>("encodingKey");
+            encodingKeyCommand.AddAlias("ekey");
+            encodingKeyCommand.AddAlias("ehash");
+            encodingKeyCommand.AddArgument(encodingKeyArg);
+            encodingKeyCommand.SetHandler(context =>
             {
-                var optionValue = command.GetValueForOption(option);
-                if (optionValue == null)
-                    continue;
+                var buildInstance = Open(context);
+                var encodingKeyStr = context.ParseResult.GetValueForArgument(encodingKeyArg);
+                var destination = context.ParseResult.GetValueForOption(Destination);
 
-                switch (option.Name)
-                {
-                    case "buildconfig":
-                        Settings.BuildConfig = (string)optionValue;
-                        break;
-                    case "cdnconfig":
-                        Settings.CDNConfig = (string)optionValue;
-                        break;
-                    case "region":
-                        Settings.Region = (string)optionValue;
-                        break;
-                    case "product":
-                        Settings.Product = (string)optionValue;
-                        break;
-                    case "locale":
-                        Settings.Locale = ((string)optionValue).ToLower() switch
-                        {
-                            "dede" => WarptenRoot.LocaleFlags.deDE,
-                            "enus" => WarptenRoot.LocaleFlags.enUS,
-                            "engb" => WarptenRoot.LocaleFlags.enGB,
-                            "ruru" => WarptenRoot.LocaleFlags.ruRU,
-                            "zhcn" => WarptenRoot.LocaleFlags.zhCN,
-                            "zhtw" => WarptenRoot.LocaleFlags.zhTW,
-                            "entw" => WarptenRoot.LocaleFlags.enTW,
-                            "eses" => WarptenRoot.LocaleFlags.esES,
-                            "esmx" => WarptenRoot.LocaleFlags.esMX,
-                            "frfr" => WarptenRoot.LocaleFlags.frFR,
-                            "itit" => WarptenRoot.LocaleFlags.itIT,
-                            "kokr" => WarptenRoot.LocaleFlags.koKR,
-                            "ptbr" => WarptenRoot.LocaleFlags.ptBR,
-                            "ptpt" => WarptenRoot.LocaleFlags.ptPT,
-                            _ => throw new Exception("Invalid locale. Available locales: deDE, enUS, enGB, ruRU, zhCN, zhTW, enTW, esES, esMX, frFR, itIT, koKR, ptBR, ptPT"),
-                        };
-                        break;
-                    case "basedir":
-                        Settings.BaseDir = (string)optionValue;
-                        break;
-                    case "inputvalue":
-                        Input = (string)optionValue;
-                        break;
-                    case "output":
-                        Output = (string)optionValue;
-                        break;
-                    case "mode":
-                        Mode = ((string)optionValue).ToLower() switch
-                        {
-                            "list" => InputMode.List,
-                            "ehash" => InputMode.EKey,
-                            "ekey" => InputMode.EKey,
-                            "chash" => InputMode.CKey,
-                            "ckey" => InputMode.CKey,
-                            "id" => InputMode.FDID,
-                            "fdid" => InputMode.FDID,
-                            "install" => InputMode.FileName,
-                            "filename" => InputMode.FileName,
-                            "name" => InputMode.FileName,
-                            _ => throw new Exception("Invalid input mode. Available modes: list, ekey/ehash, ckey/chash, fdid/id, filename/name"),
-                        };
-                        break;
-
-                    case "version":
-                    case "help":
-                        break;
-                    default:
-                        Console.WriteLine("Unhandled command line option " + option.Name);
-                        break;
-                }
-            }
-
-            if (Mode == null)
-            {
-                Console.WriteLine("No input mode specified. Available modes: list, ekey, ckey, fdid, filename. Run with -h or --help for more information.");
-                return;
-            }
-
-            if (Mode == InputMode.List)
-                Output ??= "extract";
-
-            if (Settings.BaseDir != null)
-            {
-                // Load from build.info
-                var buildInfoPath = Path.Combine(Settings.BaseDir, ".build.info");
-                if (!File.Exists(buildInfoPath))
-                    throw new Exception("No build.info found in base directory, is this a valid WoW installation?");
-
-                var buildInfo = new BuildInfo(buildInfoPath);
-
-                if (!buildInfo.Entries.Any(x => x.Product == Settings.Product))
-                    throw new Exception("No build found for product " + Settings.Product + " in .build.info, are you sure this product is installed?");
-
-                var build = buildInfo.Entries.First(x => x.Product == Settings.Product);
-
-                Settings.BuildConfig ??= build.BuildConfig;
-                Settings.CDNConfig ??= build.CDNConfig;
-            }
-            else
-            {
-                // Load from patch service
-                var versions = await CDN.GetProductVersions(Settings.Product);
-                foreach (var line in versions.Split('\n'))
-                {
-                    if (!line.StartsWith(Settings.Region + "|"))
-                        continue;
-
-                    var splitLine = line.Split('|');
-
-                    Settings.BuildConfig ??= splitLine[1];
-                    Settings.CDNConfig ??= splitLine[2];
-                }
-            }
-        }
-
-        private static void HandleList(BuildInstance build, string path)
-        {
-            if (!File.Exists(path))
-            {
-                Console.WriteLine("Input file list " + path + " not found, skipping extraction..");
-                return;
-            }
-
-            Parallel.ForEach(File.ReadAllLines(path), (line) =>
-            {
-                var parts = line.Split(';');
-                if (parts[0] == "ckey" || parts[0] == "chash")
-                {
-                    HandleCKey(build, parts[1], parts.Length == 3 ? parts[2] : null);
-                }
-                else if (parts[0] == "ekey" || parts[0] == "ehash")
-                {
-                    HandleEKey(parts[1], parts.Length == 3 ? parts[2] : null);
-                }
-                else if (parts[0] == "install")
-                {
-                    HandleFileName(build, parts[1], parts.Length == 3 ? parts[2] : null);
-                }
-                else if (uint.TryParse(parts[0], out var fileDataID))
-                {
-                    HandleFDID(build, parts[0], parts.Length == 2 ? parts[1] : null);
-                }
-                else if (parts.Length == 1 || parts.Length == 2)
-                {
-                    // Assume filename
-                    HandleFileName(build, parts[0], parts.Length == 2 ? parts[1] : parts[0]);
-                }
+                var encodingKey = Convert.FromHexString(encodingKeyStr);
+                var fileData = HandleContentKey(buildInstance, encodingKey);
             });
+
+            var fileNameCommand = new Command("extractFileName", "Extracts a file given its complete path.");
+            var fileNameArg = new Argument<string>("fileName");
+            fileNameCommand.AddArgument(fileNameArg);
+            fileNameCommand.SetHandler(context =>
+            {
+                var buildInstance = Open(context);
+                var fileName = context.ParseResult.GetValueForArgument(fileNameArg);
+                var destination = context.ParseResult.GetValueForOption(Destination);
+
+                var fileData = HandleFileName(buildInstance, fileName);
+            });
+
+            var commandFileCommand = new Command("runCommands", "Extracts a set of files from the provided file.");
+            var commandFileArg = new Argument<FileInfo>("filePath");
+            commandFileCommand.AddArgument(commandFileArg);
+            commandFileCommand.SetHandler(context =>
+            {
+                var buildInstance = Open(context);
+                var commandFile = context.ParseResult.GetValueForArgument(commandFileArg);
+                var destination = context.ParseResult.GetValueForOption(Destination) as DirectoryInfo;
+                if (destination != null)
+                    destination = new DirectoryInfo("./");
+            });
+
+            root.AddCommand(fileDataCommand);
+            root.AddCommand(encodingKeyCommand);
+            root.AddCommand(contentKeyCommand);
+            root.AddCommand(fileNameCommand);
+
+            foreach (var command in root.OfType<Command>().Cast<Command>())
+                command.Add(Destination);
+
+            root.Invoke(args);
         }
 
-        private static void HandleEKey(string eKey, string? filename)
+        private static byte[] HandleFileDataID(BuildInstance buildInstance, uint fileDataID)
         {
-            if (eKey.Length != 32 || !eKey.All("0123456789abcdef".Contains))
-            {
-                Console.WriteLine("Skipping " + eKey + ", invalid formatting for EKey (expected 32 character hex string).");
-                return;
-            }
-
-            extractionTargets.Add((Convert.FromHexString(eKey), 0, !string.IsNullOrEmpty(filename) ? filename : eKey));
-        }
-
-        private static void HandleCKey(BuildInstance build, string cKey, string? filename)
-        {
-            if (cKey.Length != 32 || !cKey.All("0123456789abcdef".Contains))
-            {
-                Console.WriteLine("Skipping " + cKey + ", invalid formatting for CKey (expected 32 character hex string).");
-                return;
-            }
-            var cKeyBytes = Convert.FromHexString(cKey);
-
-            if (!build.Encoding.TryFindEntry(cKeyBytes, out var fileEKeys) || fileEKeys == null)
-            {
-                Console.WriteLine("Skipping " + cKey + ", CKey not found in encoding.");
-                return;
-            }
-
-            extractionTargets.Add((fileEKeys.Value[0].ToArray(), fileEKeys.Value.DecodedFileSize, !string.IsNullOrEmpty(filename) ? filename : cKey));
-        }
-
-        private static void HandleFDID(BuildInstance build, string fdid, string? filename)
-        {
-            if (!uint.TryParse(fdid, out var fileDataID))
-            {
-                Console.WriteLine("Skipping FDID " + fdid + ", invalid input format (expected unsigned integer).");
-                return; 
-            }
-
-            ref readonly var fileEntry = ref build.Root.FindFileDataID(fileDataID);
+            ref readonly var fileEntry = ref buildInstance.Root.FindFileDataID(fileDataID);
             if (Unsafe.IsNullRef(in fileEntry))
-            {
-                Console.WriteLine("Skipping FDID " + fdid + ", not found in root.");
-                return;
-            }
+                return [];
 
-            if (!build.Encoding.TryFindEntry(fileEntry.ContentKey, out var fileEKeys) || fileEKeys == null)
-            {
-                Console.WriteLine("Skipping FDID " + fdid + ", CKey not found in encoding.");
-                return;
-            }
-
-            Console.WriteLine(build.Encoding.FindSpec(fileEntry.ContentKey)?.eSpec ?? "None");
-
-            extractionTargets.Add((fileEKeys.Value[0].ToArray(), fileEKeys.Value.DecodedFileSize, !string.IsNullOrEmpty(filename) ? filename : fdid));
+            return HandleContentKey(buildInstance, fileEntry.ContentKey);
         }
 
-        private static void HandleFileName(BuildInstance build, string filename, string? outputFilename)
+        private static byte[] HandleContentKey(BuildInstance buildInstance, ReadOnlySpan<byte> contentKey)
+        {
+            if (!buildInstance.Encoding.TryFindEntry(contentKey, out var fileEKeys) || fileEKeys == null)
+                return [];
+
+            for (var i = 0; i < fileEKeys.Value.Length; ++i)
+            {
+                var fileData = HandleEncodingKey(buildInstance, fileEKeys.Value[i]);
+                if (fileData.Length != 0)
+                    return fileData;
+            }
+
+            return [];
+        }
+
+        private static byte[] HandleFileName(BuildInstance buildInstance, string fileName)
         {
             // TODO: Add listfile support?
+            var fileEntries = buildInstance.Install.Entries
+                .Where(x => x.name.Equals(fileName, StringComparison.InvariantCultureIgnoreCase))
+                .ToList();
 
-            var fileEntries = build.Install.Entries.Where(x => x.name.Equals(filename, StringComparison.InvariantCultureIgnoreCase)).ToList();
             if (fileEntries.Count == 0)
-            {
-                Console.WriteLine("Skipping " + filename + ", no file by that name found in install.");
-                return;
-            }
+                return [];
 
             byte[] targetCKey;
             if (fileEntries.Count > 1)
@@ -388,12 +284,12 @@ namespace TACTTool
                 var filter = fileEntries.Where(x => x.tags.Contains("4=US")).Select(x => x.md5);
                 if (filter.Any())
                 {
-                    Console.WriteLine("Multiple results found in install for file " + filename + ", using US version..");
+                    // Console.WriteLine("Multiple results found in install for file " + filename + ", using US version..");
                     targetCKey = filter.First();
                 }
                 else
                 {
-                    Console.WriteLine("Multiple results found in install for file " + filename + ", using first result..");
+                    // Console.WriteLine("Multiple results found in install for file " + filename + ", using first result..");
                     targetCKey = fileEntries[0].md5;
                 }
             }
@@ -402,10 +298,46 @@ namespace TACTTool
                 targetCKey = fileEntries[0].md5;
             }
 
-            if (!build.Encoding.TryFindEntry(targetCKey, out var fileEKeys) || fileEKeys == null)
-                throw new Exception("EKey not found in encoding");
+            return HandleContentKey(buildInstance, targetCKey);
+        }
 
-            extractionTargets.Add((fileEKeys.Value[0].ToArray(), fileEKeys.Value.DecodedFileSize, !string.IsNullOrEmpty(outputFilename) ? outputFilename : filename));
+        private static byte[] HandleEncodingKey(BuildInstance buildInstance, ReadOnlySpan<byte> encodingKey)
+            => buildInstance.OpenFileByEKey(encodingKey);
+
+        private static Config? OpenConfiguration(CDN cdn, string? input)
+        {
+            if (string.IsNullOrEmpty(input))
+                return null;
+
+            // If link type was explicitely specified trust it, but still assert the resource exists.
+            if (input[4] == ':')
+            {
+                if (input.AsSpan().StartsWith("file:") && File.Exists(input[5..]))
+                    return Config.FromDisk(input[5..]);
+
+                try
+                {
+                    if (input.AsSpan().StartsWith("hash:"))
+                        return Config.FromHash(cdn, Convert.FromHexString(input.AsSpan()[5..]));
+                }
+                catch (Exception)
+                {
+                }
+
+                return null;
+            }
+            else
+            {
+                try
+                {
+                    var configKey = Convert.FromHexString(input);
+                    return Config.FromHash(cdn, configKey);
+                }
+                catch (FormatException)
+                {
+                    return Config.FromDisk(input);
+                }
+            }
         }
     }
 }

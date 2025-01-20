@@ -9,6 +9,7 @@ namespace TACTBench
     [MemoryDiagnoser]
     public class GlobalBenchmarks
     {
+        /*
         [GlobalSetup]
         public async Task SpecificSetup() {
             var versions = await CDN.GetProductVersions("wow");
@@ -24,7 +25,7 @@ namespace TACTBench
                 break;
             }
         }
-
+        
         [Benchmark]
         public async Task<EncodingInstance.Entry?> CompleteWorkflow() {
             var build = new BuildInstance(Settings.BuildConfig!, Settings.CDNConfig!);
@@ -40,7 +41,7 @@ namespace TACTBench
 
             build.Encoding.TryFindEntry(fileEntry.ContentKey, out var entry);
             return entry;
-        }
+        }*/
     }
 
 }

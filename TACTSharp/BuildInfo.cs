@@ -1,4 +1,6 @@
-﻿namespace TACTSharp
+﻿using System.Diagnostics;
+
+namespace TACTSharp
 {
     public class BuildInfo
     {
@@ -15,22 +17,25 @@
             public string Armadillo;
         }
 
-        public List<AvailableBuild> Entries = [];
+        public readonly AvailableBuild[] Entries = [];
 
-        public BuildInfo(string path)
+        public BuildInfo(Settings settings, string path)
         {
+            Debug.Assert(settings.BaseDirectory != null);
+
             var headerMap = new Dictionary<string, byte>();
 
             var folderMap = new Dictionary<string, string>();
-            foreach (var flavorFile in Directory.GetFiles(Settings.BaseDir, ".flavor.info", SearchOption.AllDirectories))
+            foreach (var flavorFile in Directory.GetFiles(settings.BaseDirectory, ".flavor.info", SearchOption.AllDirectories))
             {
                 var flavorLines = File.ReadAllLines(flavorFile);
                 if (flavorLines.Length < 2)
                     continue;
 
-                folderMap.Add(flavorLines[1], Path.GetFileName(Path.GetDirectoryName(flavorFile)));
+                folderMap.Add(flavorLines[1], Path.GetFileName(Path.GetDirectoryName(flavorFile)!));
             }
 
+            var entries = new List<AvailableBuild>();
             foreach (var line in File.ReadAllLines(path))
             {
                 var splitLine = line.Split("|");
@@ -55,16 +60,18 @@
                 if (headerMap.TryGetValue("KeyRing", out byte keyRing))
                     availableBuild.KeyRing = splitLine[keyRing];
 
-                if (headerMap.TryGetValue("CDN Hosts", out byte cdnHosts))
-                    CDN.SetCDNs(splitLine[cdnHosts].Split(' '));
+                // if (headerMap.TryGetValue("CDN Hosts", out byte cdnHosts))
+                //     CDN.SetCDNs(splitLine[cdnHosts].Split(' '));
 
-                if (folderMap.TryGetValue(availableBuild.Product, out string folder))
+                if (folderMap.TryGetValue(availableBuild.Product, out var folder))
                     availableBuild.Folder = folder;
                 else
                     Console.WriteLine("No flavor found matching " + availableBuild.Product);
 
-                Entries.Add(availableBuild);
+                entries.Add(availableBuild);
             }
+
+            Entries = [.. entries];
         }
     }
 }
