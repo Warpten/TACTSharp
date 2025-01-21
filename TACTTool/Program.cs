@@ -3,6 +3,8 @@ using System.CommandLine.Binding;
 using System.CommandLine.Invocation;
 using System.Runtime.CompilerServices;
 
+using Microsoft.Extensions.Logging;
+
 using TACTSharp;
 using TACTSharp.Instance;
 
@@ -35,7 +37,8 @@ namespace TACTTool
             getDefaultValue: () => LocaleFlags.enUS
         );
         private static Option<FileSystemInfo> Destination = new(
-            name: "--output"
+            name: "--output",
+            getDefaultValue: () => new DirectoryInfo("./")
         );
         private static Option<DirectoryInfo> CacheDirectory = new(
             name: "--cacheDirectory",
@@ -45,6 +48,11 @@ namespace TACTTool
         private static Option<DirectoryInfo> BaseDirectory = new(
             name: "--baseDirectory",
             description: "A path to an installation of WoW to use as source for build informations and local read-only cache."
+        );
+        private static Option<LogLevel> LogLevel = new(
+            name: "--logLevel",
+            getDefaultValue: () => Microsoft.Extensions.Logging.LogLevel.Information,
+            description: "Determines what level of logging should be enabled."
         );
 
         private static bool ValidateConfigurationIdentifier(string? identifier)
@@ -78,8 +86,22 @@ namespace TACTTool
             });
         }
 
-        private static BuildInstance Open(InvocationContext invocationContext)
+        private static (BuildInstance, ILogger) Open(InvocationContext invocationContext)
         {
+            var logLevel = invocationContext.ParseResult.GetValueForOption(LogLevel);
+
+            var loggerFactory = LoggerFactory.Create(builder => {
+                builder.SetMinimumLevel(logLevel)
+                    .AddSimpleConsole(options => {
+                        options.IncludeScopes = false;
+                        options.SingleLine = true;
+                        options.TimestampFormat = "HH:mm:ss.fff ";
+                    });
+            });
+            var logger = loggerFactory.CreateLogger<Program>();
+
+            logger.LogInformation("TACTTool is starting...");
+
             var settings = new Settings()
             {
                 Product = invocationContext.ParseResult.GetValueForOption(Product)!,
@@ -87,28 +109,34 @@ namespace TACTTool
                 Region = invocationContext.ParseResult.GetValueForOption(Region)!,
                 CacheDirectory = invocationContext.ParseResult.GetValueForOption(CacheDirectory)!.FullName,
                 BaseDirectory = invocationContext.ParseResult.GetValueForOption(BaseDirectory)?.FullName,
+                LoggerFactory = loggerFactory
             };
 
             var resourceManager = new ResourceManager(settings);
 
-            var buildConfig = OpenConfiguration(resourceManager, invocationContext.ParseResult.GetValueForOption(BuildConfig));
-            var cdnConfig = OpenConfiguration(resourceManager, invocationContext.ParseResult.GetValueForOption(CDNConfig));
+            var buildConfigName = invocationContext.ParseResult.GetValueForOption(BuildConfig);
+            var cdnConfigName = invocationContext.ParseResult.GetValueForOption(CDNConfig);
+
+            var buildConfig = OpenConfiguration(resourceManager, buildConfigName);
+            var cdnConfig = OpenConfiguration(resourceManager, cdnConfigName);
 
             if ((buildConfig == null) != (cdnConfig == null))
                 throw new InvalidOperationException("Providing either a build or cdn configuration requires the other.");
 
             if (buildConfig == null && cdnConfig == null)
             {
-                var (lhs, rhs) = resourceManager.Remote.QueryLatestVersions();
-                buildConfig = OpenConfiguration(resourceManager, lhs);
-                cdnConfig = OpenConfiguration(resourceManager, rhs);
+                (buildConfigName, cdnConfigName) = resourceManager.Remote.QueryLatestVersions();
+                buildConfig = OpenConfiguration(resourceManager, buildConfigName);
+                cdnConfig = OpenConfiguration(resourceManager, cdnConfigName);
             }
 
             if (buildConfig == null) throw new ArgumentNullException(nameof(buildConfig));
             if (cdnConfig == null) throw new ArgumentNullException(nameof(cdnConfig));
 
+            logger.LogInformation("Using configuration (Build: {Build}, CDN: {CDN})", buildConfigName, cdnConfigName);
+
             var configuration = new Configuration(buildConfig, cdnConfig);
-            return new BuildInstance(settings, configuration, resourceManager);
+            return (new BuildInstance(settings, configuration, resourceManager), logger);
         }
 
         public static void Main(string[] args)
@@ -121,11 +149,12 @@ namespace TACTTool
             fileDataCommand.AddArgument(fileDataArg);
             fileDataCommand.SetHandler(context =>
             {
-                var buildInstance = Open(context);
+                var (buildInstance, logger) = Open(context);
                 var fileDataID = context.ParseResult.GetValueForArgument(fileDataArg);
                 var destination = context.ParseResult.GetValueForOption(Destination);
 
                 var fileData = HandleFileDataID(buildInstance, fileDataID);
+                ProcessExtractTarget(logger, destination, fileData, fileDataID.ToString());
             });
 
             var contentKeyCommand = new Command("extractContentKey", "Extracts a file given its content key.");
@@ -135,7 +164,7 @@ namespace TACTTool
             contentKeyCommand.AddArgument(contentKeyArg);
             contentKeyCommand.SetHandler(context =>
             {
-                var buildInstance = Open(context);
+                var (buildInstance, logger) = Open(context);
                 var contentKeyStr = context.ParseResult.GetValueForArgument(contentKeyArg);
                 var destination = context.ParseResult.GetValueForOption(Destination);
 
@@ -145,6 +174,7 @@ namespace TACTTool
                     return;
 
                 var fileData = HandleContentKey(buildInstance, contentKey);
+                ProcessExtractTarget(logger, destination, fileData, contentKeyStr);
             });
 
             var encodingKeyCommand = new Command("extractEncodingKey", "Extractsd a file given its encoding key.");
@@ -154,12 +184,14 @@ namespace TACTTool
             encodingKeyCommand.AddArgument(encodingKeyArg);
             encodingKeyCommand.SetHandler(context =>
             {
-                var buildInstance = Open(context);
+                var (buildInstance, logger) = Open(context);
                 var encodingKeyStr = context.ParseResult.GetValueForArgument(encodingKeyArg);
                 var destination = context.ParseResult.GetValueForOption(Destination);
 
                 var encodingKey = Convert.FromHexString(encodingKeyStr);
                 var fileData = HandleContentKey(buildInstance, encodingKey);
+
+                ProcessExtractTarget(logger, destination, fileData, encodingKeyStr);
             });
 
             var fileNameCommand = new Command("extractFileName", "Extracts a file given its complete path.");
@@ -167,11 +199,12 @@ namespace TACTTool
             fileNameCommand.AddArgument(fileNameArg);
             fileNameCommand.SetHandler(context =>
             {
-                var buildInstance = Open(context);
+                var (buildInstance, logger) = Open(context);
                 var fileName = context.ParseResult.GetValueForArgument(fileNameArg);
                 var destination = context.ParseResult.GetValueForOption(Destination);
 
                 var fileData = HandleFileName(buildInstance, fileName);
+                ProcessExtractTarget(logger, destination, fileData, fileName);
             });
 
             var commandFileCommand = new Command("runCommands", "Extracts a set of files from the provided file.");
@@ -179,11 +212,10 @@ namespace TACTTool
             commandFileCommand.AddArgument(commandFileArg);
             commandFileCommand.SetHandler(context =>
             {
-                var buildInstance = Open(context);
+                var (buildInstance, logger) = Open(context);
                 var commandFile = context.ParseResult.GetValueForArgument(commandFileArg);
                 var destination = context.ParseResult.GetValueForOption(Destination) as DirectoryInfo;
-                if (destination != null)
-                    destination = new DirectoryInfo("./");
+
             });
 
             root.AddCommand(fileDataCommand);
@@ -195,6 +227,25 @@ namespace TACTTool
                 command.Add(Destination);
 
             root.Invoke(args);
+        }
+
+        private static void ProcessExtractTarget(ILogger logger, FileSystemInfo? destination, ReadOnlySpan<byte> fileData, string sourceName)
+        {
+            if (fileData.Length == 0)
+                logger.LogError("`{SourceName}` could not be extracted.", sourceName);
+            else if (destination is FileInfo fileInfo)
+            {
+                File.WriteAllBytes(fileInfo.FullName, fileData);
+
+                logger.LogInformation("Extracted `{SourceName}` to `{Destination}`.", sourceName, fileInfo.FullName);
+            }
+            else if (destination is DirectoryInfo directoryInfo)
+            {
+                var concretePath = Path.Combine(directoryInfo.FullName, sourceName);
+                File.WriteAllBytes(concretePath, fileData);
+
+                logger.LogInformation("Extracted `{SourceName}` to `{Destination}`.", sourceName, concretePath);
+            }
         }
 
         private static byte[] HandleFileDataID(BuildInstance buildInstance, uint fileDataID)

@@ -1,5 +1,7 @@
 ﻿using System.Diagnostics;
 
+using Microsoft.Extensions.Logging;
+
 namespace TACTSharp
 {
     public class Settings
@@ -17,5 +19,10 @@ namespace TACTSharp
         /// Path to a folder containing cached data.
         /// </summary>
         public string CacheDirectory { get; set; } = "./cache";
+
+        /// <summary>
+        /// A logging factory to carry around.
+        /// </summary>
+        public ILoggerFactory? LoggerFactory { get; set; }
     }
 }

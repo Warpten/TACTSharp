@@ -117,6 +117,8 @@ namespace TACTSharp
             _pages = [.. pages];
         }
 
+        public int Count => _pages.Sum(page => page.Records.Length);
+
         private static PageHeader ParseManifestPageHeader(ref ReadOnlySpan<byte> fileData, int version) {
             switch (version)
             {

@@ -1,15 +1,11 @@
-﻿using Microsoft.Win32.SafeHandles;
+﻿using Microsoft.Extensions.Logging;
+using Microsoft.Win32.SafeHandles;
 using System.IO.MemoryMappedFiles;
 
 namespace TACTSharp
 {
-    public sealed class CASCIndexInstance
+    public sealed class CASCIndexInstance : IDisposable
     {
-        private readonly long indexSize;
-
-        private readonly short archiveIndex = -1;
-
-        private readonly string path;
         private readonly IndexHeader header;
 
         private readonly MemoryMappedFile indexFile;
@@ -21,11 +17,8 @@ namespace TACTSharp
         private readonly int ofsStartOfEntries;
         private readonly int ofsEndOfEntries;
 
-        public CASCIndexInstance(string path)
+        public CASCIndexInstance(string path, ILoggerFactory? loggerFactory = null)
         {
-            this.path = path;
-            this.indexSize = new FileInfo(path).Length;
-
             // create from filestream instead so battle.net doesn't freak out
             this.indexFile = MemoryMappedFile.CreateFromFile(new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite), null, 0, MemoryMappedFileAccess.Read, HandleInheritability.None, false);
             this.accessor = indexFile.CreateViewAccessor(0, 0, MemoryMappedFileAccess.Read);
@@ -37,6 +30,13 @@ namespace TACTSharp
 
             this.ofsStartOfEntries = 40;
             this.ofsEndOfEntries = (int)(this.ofsStartOfEntries + header.entriesSize);
+        }
+
+        public void Dispose()
+        {
+            this.mmapViewHandle.Dispose();
+            this.accessor.Dispose();
+            this.indexFile.Dispose();
         }
 
         unsafe static private byte* LowerBoundEkey(byte* begin, byte* end, long dataSize, ReadOnlySpan<byte> needle)

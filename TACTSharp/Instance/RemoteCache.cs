@@ -3,9 +3,13 @@ using System.Net.NetworkInformation;
 using System.Security.Cryptography;
 using System.Text;
 
+using Microsoft.Extensions.Logging;
+
+using TACTSharp.Extensions;
+
 namespace TACTSharp.Instance
 {
-    public class RemoteCache
+    public sealed partial class RemoteCache : LoggingEnabledBase<RemoteCache>
     {
         private readonly struct Servers(HttpClient[] clients)
         {
@@ -19,7 +23,7 @@ namespace TACTSharp.Instance
         private readonly string _product;
         private readonly string _region;
 
-        public RemoteCache(string baseDirectory, string product, string region)
+        public RemoteCache(string baseDirectory, string product, string region, ILoggerFactory? loggerFactory = null) : base(loggerFactory)
         {
             _product = product;
             _region = region;
@@ -32,14 +36,24 @@ namespace TACTSharp.Instance
 
             _baseDirectory = new DirectoryInfo(baseDirectory + '/' + stem);
             _baseDirectory.Create();
+
+            LogInitializationComplete(Logger, _product, _region, _baseDirectory);
         }
+
+        [LoggerMessage(Level = LogLevel.Information, Message = "Downloading `{ResourcePath}`.")]
+        private static partial void LogDownloadStart(ILogger logger, string resourcePath);
+
+        [LoggerMessage(Level = LogLevel.Trace, Message = "Attempting to retrieve `{ResourcePath}` from `{BaseAddress}`.")]
+        private static partial void LogDownloadStartAttempt(ILogger logger, string resourcePath, Uri baseAddress);
 
         private Stream Download(string resourcePath)
         {
             using var @lock  = _servers.@lock.EnterScope();
             for (var i = 0; i < _servers.Clients.Length; ++i)
             {
-                var request = new HttpRequestMessage(HttpMethod.Head, resourcePath);
+                LogDownloadStartAttempt(Logger, resourcePath, _servers.Clients[i].BaseAddress!);
+
+                var request = new HttpRequestMessage(HttpMethod.Get, resourcePath);
                 var response = _servers.Clients[i].Send(request);
                 if (!response.IsSuccessStatusCode)
                     continue;
@@ -55,31 +69,46 @@ namespace TACTSharp.Instance
             var localPath = Path.Combine(_baseDirectory.FullName, resourceType.LocalPath, fileName[0..2], fileName[2..4], fileName);
 
             var fileInfo = new FileInfo(localPath);
-            var resource = new Resource(fileInfo, offset, length);
 
             if (!fileInfo.Exists)
             {
+                var remotePath = Path.Combine(resourceType.RemotePath, fileName[0..2], fileName[2..4], fileName);
+                LogDownloadStart(Logger, remotePath);
+
+                using var loggingScope = BeginTimedScope(
+                    timeSpent => Logger.LogInformation("Downloaded `{ResourcePath}` ({Duration:c}).", remotePath, timeSpent)
+                );
+
                 fileInfo.Directory!.Create();
 
-                var remotePath = Path.Combine(resourceType.RemotePath, fileName[0..2], fileName[2..4], fileName);
-                using (var fileStream = fileInfo.Create())
+                using (var fileStream = fileInfo.OpenWrite())
                     Download(remotePath).CopyTo(fileStream);
 
                 fileInfo.Refresh();
+                if (fileInfo.Length == 0)
+                {
+                    fileInfo.Delete();
+                    fileInfo.Refresh();
+                }
+
+                return new Resource(fileInfo, offset, length);
             }
 
-            return resource;
+            return new Resource(fileInfo, offset, length);
         }
 
-        public Resource OpenResource(ResourceType resourceType, ReadOnlySpan<byte> encodingKey, string fileName, long offset = 0, long length = 0)
+        public Resource OpenResource(ResourceType resourceType, ReadOnlySpan<byte> encodingKey, string fileName, long offset = 0, long length = 0, bool validate = false)
         {
             var resource = OpenResource(resourceType, fileName, offset, length);
-            if (resource.Exists)
+            if (resource.Exists && validate)
             {
-                var checksum = resource.OpenMemoryMapped(MD5.HashData);
+                var checksum = resource.OpenMemoryMapped(MD5.HashData, static () => []);
                 if (encodingKey.SequenceEqual(checksum))
                     return resource;
-                
+
+                if (Logger.IsEnabled(LogLevel.Error))
+                    LogChecksumError(Logger, resource.FileInfo.FullName, Convert.ToHexStringLower(encodingKey), Convert.ToHexStringLower(checksum));
+
                 resource.FileInfo.Delete();
                 resource.FileInfo.Refresh();
             }
@@ -87,14 +116,16 @@ namespace TACTSharp.Instance
             return resource;
         }
 
-        public Resource OpenResource(ResourceType resourceType, ReadOnlySpan<byte> encodingKey)
+        public Resource OpenResource(ResourceType resourceType, ReadOnlySpan<byte> encodingKey, bool validate = false)
         {
             var fileName = Convert.ToHexStringLower(encodingKey);
-            return OpenResource(resourceType, encodingKey, fileName);
+            return OpenResource(resourceType, encodingKey, fileName, validate: validate);
         }
 
         public (string Build, string CDN) QueryLatestVersions()
         {
+            Logger.LogTrace("Querying versions from patch service.");
+
             var request = new HttpRequestMessage(HttpMethod.Get, $"versions");
             var response = _patchClient.Send(request);
             if (response.IsSuccessStatusCode)
@@ -122,6 +153,8 @@ namespace TACTSharp.Instance
 
         private (Servers, string) InitializeServers()
         {
+            Logger.LogTrace("Querying CDNs from patch server.");
+
             var servers = new List<HttpClient>();
             var stem = default(string);
 
@@ -157,6 +190,7 @@ namespace TACTSharp.Instance
                 try
                 {
                     var response = await new Ping().SendPingAsync(server.BaseAddress!.Host, 400);
+                    Logger.LogTrace("`{ServerName}` replied in less than {Ping} ms.", server.BaseAddress!.Host, response.RoundtripTime);
 
                     return (Server: server, Ping: response.RoundtripTime);
                 }
@@ -166,10 +200,12 @@ namespace TACTSharp.Instance
                     if (pingException.InnerException is NotSupportedException)
                         return (Server: server, Ping: 1000L);
 
+                    Logger.LogError(pingException, "An error occured while pinging `{ServerName}`.", server.BaseAddress!.Host);
                     return (Server: server, Ping: long.MaxValue);
                 }
                 catch (Exception)
                 {
+                    Logger.LogTrace("`{ServerName}` did not reply; discarding.", server.BaseAddress!.Host);
                     return (Server: server, Ping: long.MaxValue);
                 }
             })).ToArray();
@@ -190,5 +226,15 @@ namespace TACTSharp.Instance
 
             return (new Servers([.. sortedServers]), stem ?? "unknown");
         }
+
+        [LoggerMessage(Level = LogLevel.Error,
+            Message = "Checksum mismatch when validating `{FileName}`: expected `{Expected}`, found `{Found}`.",
+            SkipEnabledCheck = true)]
+        private static partial void LogChecksumError(ILogger logger, string fileName, string expected, string found);
+
+        [LoggerMessage(Level = LogLevel.Information,
+            Message = "(`{Product}`)(`{Region}`) CDN cache folder initialized to `{BaseDirectory}`.",
+            SkipEnabledCheck = true)]
+        private static partial void LogInitializationComplete(ILogger logger, string product, string region, DirectoryInfo baseDirectory);
     }
 }

@@ -1,12 +1,16 @@
 ﻿using System.Buffers.Binary;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
+
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
+
 using TACTSharp.Instance;
 
 namespace TACTSharp
 {
     // roughly based on schlumpf's implementation
-    public static class GroupIndex
+    public class GroupIndex
     {
         private struct IndexEntry
         {
@@ -29,7 +33,7 @@ namespace TACTSharp
                 options,
                 () => new List<IndexEntry>(),
                 (itr, parallelLoopState, indexEntries) => {
-                    var resource = resourceManager.Resolve(ResourceType.Data, itr.Archive + ".index");
+                    var resource = resourceManager.Resolve(ResourceType.Indice, itr.Archive + ".index");
                     if (!resource.Exists)
                         return indexEntries;
 

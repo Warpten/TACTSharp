@@ -1,16 +1,19 @@
+using Microsoft.Extensions.Logging;
+
 using TACTSharp.Instance;
 
 namespace TACTSharp
 {
-    public sealed class LocalCache
+    public sealed partial class LocalCache : LoggingEnabledBase<LocalCache>
     {
         private readonly DirectoryInfo _baseDirectory;
         private readonly CASCIndexInstance[] _localIndices;
 
-        public LocalCache(DirectoryInfo baseDirectory)
+        public LocalCache(DirectoryInfo baseDirectory, ILoggerFactory? loggerFactory = null) : base(loggerFactory)
         {
-            _baseDirectory = baseDirectory;
+            LogInitialization(Logger, baseDirectory);
 
+            _baseDirectory = baseDirectory;
             var dataFiles = _baseDirectory.EnumerateFiles("Data/data/*.idx", SearchOption.AllDirectories).ToArray();
             var indices = new List<CASCIndexInstance>(dataFiles.Length);
 
@@ -20,11 +23,14 @@ namespace TACTSharp
                     continue;
 
                 var indexBucket = Convert.FromHexString(indexFile.Name.AsSpan()[0..2])[0];
-                indices[indexBucket] = new CASCIndexInstance(indexFile.FullName);
+                indices[indexBucket] = new CASCIndexInstance(indexFile.FullName, loggerFactory);
             }
 
-            _localIndices = [..indices];
+            _localIndices = [.. indices];
         }
+
+        [LoggerMessage(Level = LogLevel.Information, Message = "Initializing local cache from `{BaseDirectory}`.")]
+        private static partial void LogInitialization(ILogger logger, DirectoryInfo baseDirectory);
 
         public Resource? OpenResource(ResourceType resourceType, string fileName)
         {
@@ -39,6 +45,9 @@ namespace TACTSharp
 
         public Resource? OpenResource(ReadOnlySpan<byte> encodingKey)
         {
+            if (_localIndices.Length == 0)
+                return null;
+
             // Identify bucket.
             var indexBucket = encodingKey[0];
             for (var i = 1; i < encodingKey.Length / 2 + 1; ++i)
@@ -49,7 +58,7 @@ namespace TACTSharp
             var targetIndex = _localIndices[indexBucket];
             var (archiveOffset, archiveSize, archiveIndex) = targetIndex.GetIndexInfo(encodingKey);
 
-            if (archiveOffset == -1)
+            if (archiveOffset != -1)
             {
                 var archivePath = Path.Combine(_baseDirectory.FullName, "Data/data", $"data.{archiveIndex:03}");
                 return new Resource(new FileInfo(archivePath), archiveOffset, archiveSize);

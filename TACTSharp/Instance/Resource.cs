@@ -24,12 +24,12 @@ namespace TACTSharp.Instance
         {
             _fileInfo = fileInfo;
             _offset = offset;
-            _length = length == 0 && _fileInfo.Exists ? _fileInfo.Length : 0;
+            _length = length == 0 && _fileInfo.Exists ? _fileInfo.Length : length;
         }
 
         public readonly Resource Decompress(ulong decompressedSize = 0)
         {
-            if (_fileInfo.Length == 0)
+            if (!_fileInfo.Exists || _fileInfo.Length == 0)
                 return this;
 
             var decompressedFile = new FileInfo(Path + ".decompressed");
@@ -48,13 +48,16 @@ namespace TACTSharp.Instance
 
         public delegate T Parser<T>(ReadOnlySpan<byte> data);
 
-        public readonly T? OpenMemoryMapped<T>(Parser<T> parser)
+        public readonly T? OpenMemoryMapped<T>(Parser<T?> parser)
+            => OpenMemoryMapped(parser, static () => default(T));
+
+        public readonly T OpenMemoryMapped<T>(Parser<T> parser, Func<T> defaultSupplier)
         {
             if (_fileInfo.Length == 0)
-                return default;
+                return defaultSupplier();
 
             using var file = MemoryMappedFile.CreateFromFile(Path, FileMode.Open, null, 0, MemoryMappedFileAccess.Read);
-            using var accessor = file.CreateViewAccessor(_offset, _length, MemoryMappedFileAccess.Read);
+            using var accessor = file.CreateViewAccessor(0, _fileInfo.Length, MemoryMappedFileAccess.Read);
 
             unsafe
             {
@@ -64,7 +67,7 @@ namespace TACTSharp.Instance
                 {
                     accessor.SafeMemoryMappedViewHandle.AcquirePointer(ref pointer);
 
-                    var dataSpan = new ReadOnlySpan<byte>(pointer, (int) _length);
+                    var dataSpan = new ReadOnlySpan<byte>(pointer, (int) _fileInfo.Length);
                     return parser(dataSpan);
                 }
                 finally

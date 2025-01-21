@@ -52,6 +52,8 @@ namespace TACTSharp
             this.ofsEndOfTocEkeys = ofsStartOfToc + footer.keyBytes * this.numBlocks;
         }
 
+        public int ApproximateCount => this.entriesPerBlock * this.numBlocks + this.entriesInLastBlock;
+
         // Binary search pointing to the first element **not** comparing SequenceCompareTo < 0 anymore.
         // [1 3 4 6]: 0 -> 1; 1 -> 1; 2 -> 3; 3 -> 3; 4 -> 4; 5 -> 6; 6 -> 6; 7 -> end.
         unsafe static private byte* LowerBoundEkey(byte* begin, byte* end, long dataSize, ReadOnlySpan<byte> needle)
