@@ -8,7 +8,7 @@ using Microsoft.Extensions.Logging;
 using TACTSharp;
 using TACTSharp.Instance;
 
-using static TACTSharp.WarptenRoot;
+using static TACTSharp.RootInstance;
 
 namespace TACTTool
 {
@@ -142,7 +142,7 @@ namespace TACTTool
         public static void Main(string[] args)
         {
             var root = new RootCommand();
-            root.AddGlobalOptions(BuildConfig, CDNConfig, Product, Region, Locale, CacheDirectory, BaseDirectory);
+            root.AddGlobalOptions(BuildConfig, CDNConfig, Product, Region, Locale, CacheDirectory, BaseDirectory, LogLevel);
 
             var fileDataCommand = new Command("extractFileDataID", "Extracts a file given its file data ID.");
             var fileDataArg = new Argument<uint>("fileDataID");
@@ -177,7 +177,7 @@ namespace TACTTool
                 ProcessExtractTarget(logger, destination, fileData, contentKeyStr);
             });
 
-            var encodingKeyCommand = new Command("extractEncodingKey", "Extractsd a file given its encoding key.");
+            var encodingKeyCommand = new Command("extractEncodingKey", "Extracts a file given its encoding key.");
             var encodingKeyArg = new Argument<string>("encodingKey");
             encodingKeyCommand.AddAlias("ekey");
             encodingKeyCommand.AddAlias("ehash");

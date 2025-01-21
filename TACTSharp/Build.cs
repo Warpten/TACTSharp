@@ -1,6 +1,4 @@
 ﻿using System.Diagnostics;
-using System.Reflection;
-using System.Resources;
 using System.Runtime.CompilerServices;
 using System.Security.Cryptography;
 
@@ -30,7 +28,7 @@ namespace TACTSharp
         public readonly ResourceManager ResourceManager;
 
         public readonly EncodingInstance Encoding;
-        public readonly WarptenRoot? Root;
+        public readonly RootInstance? Root;
         public readonly InstallInstance Install;
         public readonly IndexInstance? GroupIndex;
         public readonly IndexInstance FileIndex;
@@ -90,7 +88,7 @@ namespace TACTSharp
 
                     byte[] checksum = resource.OpenMemoryMapped(MD5.HashData, () => []);
                     if (contentKey.SequenceEqual(checksum))
-                        Root = resource.OpenMemoryMapped(rawData => new WarptenRoot(rawData, settings))!;
+                        Root = resource.OpenMemoryMapped(rawData => new RootInstance(rawData, settings))!;
                 }
             }
 

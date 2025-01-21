@@ -6,9 +6,9 @@ using System.Text;
 static class Extensions
 {
     /// <summary>
-    /// Returns a given element in an array, bypassing bounds check automatically inserted by the JITter.
+    /// Returns an element in an array, bypassing bounds check automatically inserted by the JITter.
     /// 
-    /// This is semantically equivalen to <pre>arr[index]</pre> but prevents the JIT from emitting bounds checks.
+    /// This is semantically equivalent to <pre>arr[index]</pre> but prevents the JIT from emitting bounds checks.
     /// 
     /// Note that in return no guarantees are made and you should always make sure the <paramref name="index"/> is within bounds
     /// yourself.
@@ -63,6 +63,13 @@ static class Extensions
     public static string ReadNullTermString(this ReadOnlySpan<byte> source)
         => Encoding.UTF8.GetString(source[..source.IndexOf((byte)0)]);
 
+    /// <summary>
+    /// Yanks <paramref name="count"/> bytes from <paramref name="data"/>, modifies
+    /// <paramref name="data"/> in-place, and returns the yanked span.
+    /// </summary>
+    /// <param name="data"></param>
+    /// <param name="count"></param>
+    /// <returns></returns>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static ReadOnlySpan<byte> Consume(this ref ReadOnlySpan<byte> data, int count) {
         var section = data[..count];
@@ -70,8 +77,13 @@ static class Extensions
         return section;
     }
 
+    /// <summary>
+    /// Unsafely promotes the boolean to an integer, bypassing normally emitted branching code.
+    /// </summary>
+    /// <param name="value"></param>
+    /// <returns></returns>
     public static int UnsafePromote(this bool value) {
-        #pragma warning disable CS0162 // Unreachable code detected
+#pragma warning disable CS0162 // Unreachable code detected
             if (sizeof(bool) == sizeof(byte)) {
                 return (int) Unsafe.As<bool, byte>(ref value);
             } else if (sizeof(bool) == sizeof(short)) {

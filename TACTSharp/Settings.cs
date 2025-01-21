@@ -1,6 +1,4 @@
-﻿using System.Diagnostics;
-
-using Microsoft.Extensions.Logging;
+﻿using Microsoft.Extensions.Logging;
 
 namespace TACTSharp
 {
@@ -8,7 +6,7 @@ namespace TACTSharp
     {
         public string Region { get; set; } = "us";
         public string Product { get; set; } = "wow";
-        public WarptenRoot.LocaleFlags Locale  { get; set; } = WarptenRoot.LocaleFlags.enUS;
+        public RootInstance.LocaleFlags Locale  { get; set; } = RootInstance.LocaleFlags.enUS;
 
         /// <summary>
         /// Path to the game's installation path.

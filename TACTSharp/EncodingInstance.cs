@@ -1,8 +1,6 @@
-﻿using Microsoft.Win32.SafeHandles;
+﻿
+using Microsoft.Win32.SafeHandles;
 using System.IO.MemoryMappedFiles;
-using System.Runtime.CompilerServices;
-using System.Runtime.InteropServices;
-using System.Text;
 
 namespace TACTSharp
 {

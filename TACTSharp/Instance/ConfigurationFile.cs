@@ -1,26 +1,25 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Diagnostics;
-using System.Linq;
+﻿using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
-using System.Runtime.InteropServices.Marshalling;
-using System.Text;
-using System.Threading.Tasks;
 
 namespace TACTSharp.Instance
 {
-    public sealed class ConfigurationFile<T>
+    /// <summary>
+    /// Provides utility methods to parse configuration files retrieve from the Battle.net patch servers.
+    /// </summary>
+    public sealed class ConfigurationFile
     {
-        public delegate T? Handler((Range Name, Range Value)[] data, ReadOnlySpan<byte> fileData);
-        public delegate T[] ArrayHandler((Range Name, Range Value)[] data, ReadOnlySpan<byte> fileData);
+        private delegate T Merge<T, U>(T lhs, U rhs) where U : allows ref struct;
+        private delegate U Transform<T, U>(T source) where T : allows ref struct;
 
-        public static T? ParseOne(ReadOnlySpan<byte> fileData, Handler handler)
+        public delegate T Handler<T>((Range Name, Range Value)[] data, ReadOnlySpan<byte> fileData);
+        public delegate T[] ArrayHandler<T>((Range Name, Range Value)[] data, ReadOnlySpan<byte> fileData);
+
+        public static T? ParseOne<T>(ReadOnlySpan<byte> fileData, Handler<T> handler)
         {
             var lineEnumerator = fileData.Split((byte)'\n');
 
             List<Range> headerTokens = [];
-            List<T> records = [];
 
             while (lineEnumerator.MoveNext())
             {
@@ -75,73 +74,13 @@ namespace TACTSharp.Instance
             return default;
         }
 
-        public static T[] Parse(ReadOnlySpan<byte> fileData, Handler handler)
+        // [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static Aggregate ParseInternal<Result, Aggregate, Accumulator>(ReadOnlySpan<byte> fileData, Handler<Result> handler,
+            Merge<Accumulator, Result> merge, Transform<Accumulator, Aggregate> transform, Accumulator accumulator, Aggregate defaultValue)
         {
-            var lineEnumerator = fileData.Split((byte) '\n');
-
             List<Range> headerTokens = [];
-            List<T> records = [];
 
-            while (lineEnumerator.MoveNext())
-            {
-                var lineRange = lineEnumerator.Current;
-                var line = fileData[lineRange];
-                if (line.Length == 0 || (line.Length >= 2 && Unsafe.ReadUnaligned<ushort>(ref MemoryMarshal.GetReference(line)) == 0x2323)) // ##
-                    continue;
-
-                foreach (var propRange in line.Split((byte) '|'))
-                {
-                    var typeMarker = line[propRange].IndexOf((byte) '!');
-                    Debug.Assert(typeMarker != -1);
-
-                    // Rebase the range to the start of the file blob
-                    var tokenStart = lineRange.Start.Value + propRange.Start.Value;
-                    headerTokens.Add(new Range(tokenStart, tokenStart + typeMarker));
-                }
-
-                break;
-            }
-
-            if (headerTokens.Count == 0)
-                return [];
-
-            while (lineEnumerator.MoveNext())
-            {
-                Debug.Assert(headerTokens.Count != 0);
-
-                var lineRange = lineEnumerator.Current;
-                var line = fileData[lineRange];
-                if (line.Length == 0 || (line.Length >= 2 && Unsafe.ReadUnaligned<ushort>(ref MemoryMarshal.GetReference(line)) == 0x2323)) // ##
-                    continue;
-
-                var recordData = GC.AllocateUninitializedArray<(Range Name, Range Value)>(headerTokens.Count);
-                var i = 0;
-                foreach (var valueRange in line.Split((byte) '|'))
-                {
-                    var tokenInfo = headerTokens[i];
-
-                    var valueStart = lineRange.Start.Value + valueRange.Start.Value;
-                    var valueEnd = lineRange.Start.Value + valueRange.End.Value;
-
-                    recordData[i] = (tokenInfo, new Range(valueStart, valueEnd));
-                    ++i;
-                }
-
-                var record = handler(recordData, fileData);
-                if (record != null)
-                    records.Add(record!);
-            }
-            
-            return [.. records];
-        }
-
-        public static T[] Parse(ReadOnlySpan<byte> fileData, ArrayHandler handler)
-        {
             var lineEnumerator = fileData.Split((byte)'\n');
-
-            List<Range> headerTokens = [];
-            List<T> records = [];
-
             while (lineEnumerator.MoveNext())
             {
                 var lineRange = lineEnumerator.Current;
@@ -163,7 +102,7 @@ namespace TACTSharp.Instance
             }
 
             if (headerTokens.Count == 0)
-                return [];
+                return defaultValue;
 
             while (lineEnumerator.MoveNext())
             {
@@ -171,10 +110,13 @@ namespace TACTSharp.Instance
 
                 var lineRange = lineEnumerator.Current;
                 var line = fileData[lineRange];
-                if (line.Length == 0 || (line.Length >= 2 && Unsafe.ReadUnaligned<ushort>(ref MemoryMarshal.GetReference(line)) == 0x2323)) // ##
+                // Skip empty lines and lines starting with ##
+                if (line.Length == 0 || (line.Length >= 2 && Unsafe.ReadUnaligned<ushort>(ref MemoryMarshal.GetReference(line)) == 0x2323))
                     continue;
 
+                // Preallocate ranges
                 var recordData = GC.AllocateUninitializedArray<(Range Name, Range Value)>(headerTokens.Count);
+                // Traverse value ranges and store
                 var i = 0;
                 foreach (var valueRange in line.Split((byte)'|'))
                 {
@@ -187,12 +129,44 @@ namespace TACTSharp.Instance
                     ++i;
                 }
 
-                var record = handler(recordData, fileData);
-                if (record != null)
-                    records.AddRange(record!);
+                // Forward to the handler
+                var lineData = handler(recordData, fileData);
+                accumulator = merge(accumulator, lineData);
             }
 
-            return [.. records];
+            return transform(accumulator);
+        }
+
+        public static T[] Parse<T>(ReadOnlySpan<byte> fileData, Handler<T[]> handler)
+        {
+            return ParseInternal<T[], T[], List<T>>(fileData, handler,
+                static (collection, block) =>
+                {
+                    collection.AddRange(block);
+                    return collection;
+                },
+                static (collection) => [.. collection],
+                [],
+                []
+            );
+        }
+
+        public static T? ParseFirst<T>(ReadOnlySpan<byte> fileData, Handler<T?> handler)
+        {
+            return ParseInternal<T?, T?, T?>(fileData, handler, (prev, current) => prev ?? current, x => x, default, default);
+        }
+
+        public static T[] Parse<T>(ReadOnlySpan<byte> fileData, Handler<T?> handler)
+        {
+            return ParseInternal<T?, T[], List<T>>(fileData, handler,
+                static (collection, item) => {
+                    if (item != null)
+                        collection.Add(item!);
+                    return collection;
+                },
+                static acc => [.. acc],
+                [], []
+            );
         }
     }
 }

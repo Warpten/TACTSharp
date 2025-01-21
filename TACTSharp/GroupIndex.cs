@@ -2,9 +2,6 @@
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 
-using Microsoft.Extensions.Logging;
-using Microsoft.Extensions.Logging.Abstractions;
-
 using TACTSharp.Instance;
 
 namespace TACTSharp

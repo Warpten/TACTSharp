@@ -1,11 +1,8 @@
-﻿using System.Diagnostics;
-using System.Net.NetworkInformation;
+﻿using System.Net.NetworkInformation;
 using System.Security.Cryptography;
 using System.Text;
 
 using Microsoft.Extensions.Logging;
-
-using TACTSharp.Extensions;
 
 namespace TACTSharp.Instance
 {
@@ -128,14 +125,14 @@ namespace TACTSharp.Instance
 
             var request = new HttpRequestMessage(HttpMethod.Get, $"versions");
             var response = _patchClient.Send(request);
-            if (response.IsSuccessStatusCode)
+            if (response.IsSuccessStatusCode && response.Content.Headers.ContentType!.MediaType == "text/plain")
             {
                 using MemoryStream memoryStream = new(8192);
                 response.Content.ReadAsStream().CopyTo(memoryStream);
 
                 ReadOnlySpan<byte> dataSpan = new(memoryStream.GetBuffer(), 0, (int)memoryStream.Position);
 
-                return ConfigurationFile<(string, string)?>.ParseOne(dataSpan, (fields, data) =>
+                return ConfigurationFile.ParseOne<(string, string)?>(dataSpan, (fields, data) =>
                 {
                     var region = Encoding.UTF8.GetString(data[fields[0].Value])!;
                     if (region != _region)
@@ -160,14 +157,14 @@ namespace TACTSharp.Instance
 
             var request = new HttpRequestMessage(HttpMethod.Get, $"cdns");
             var response = _patchClient.Send(request);
-            if (response.IsSuccessStatusCode)
+            if (response.IsSuccessStatusCode && response.Content.Headers.ContentType!.MediaType == "text/plain")
             {
                 using MemoryStream memoryStream = new (8192);
                 response.Content.ReadAsStream().CopyTo(memoryStream);
 
                 ReadOnlySpan<byte> dataSpan = new (memoryStream.GetBuffer(), 0, (int) memoryStream.Position);
 
-                servers.AddRange(ConfigurationFile<HttpClient>.Parse(dataSpan, (fields, data) =>
+                servers.AddRange(ConfigurationFile.Parse<HttpClient>(dataSpan, (fields, data) =>
                 {
                     var region = Encoding.UTF8.GetString(data[fields[0].Value])!;
                     if (region != _region)
