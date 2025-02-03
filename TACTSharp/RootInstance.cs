@@ -1,18 +1,22 @@
 ﻿using Microsoft.Win32.SafeHandles;
+using System;
 using System.Buffers.Binary;
 using System.Collections.ObjectModel;
+using System.ComponentModel.Design.Serialization;
 using System.Diagnostics;
 using System.IO.MemoryMappedFiles;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 
 using TACTSharp.Extensions;
+using static TACTSharp.Extensions.BinarySearchExtensions;
 
 namespace TACTSharp
 {
     public class RootInstance
     {
         private readonly Page[] _pages;
+        private readonly CompressedPage[] _compressedPages;
         private readonly Dictionary<ulong, (int, int)> _hashes = [];
 
         [Flags]
@@ -77,6 +81,7 @@ namespace TACTSharp
             // Skip the header.
             fileData = fileData[headerSize..];
 
+            var compressedPages = new List<CompressedPage>();
             var pages = new List<Page>();
             while (fileData.Length != 0)
             {
@@ -107,8 +112,25 @@ namespace TACTSharp
 
                 // Read a FDID delta array from the file (+1 implied) and adjust instantly.
                 var fdids = blockData.ReadUInt32LE(recordCount);
-                for (var i = 1; i < fdids.Length; ++i)
+
+                // Lookup optimization (sic): Emit compressed pages that are just 12 bytes
+                // and store the page index and a range of possible values.
+                var initialFileDataID = 0;
+                var sequenceSize = 0;
+                for (var i = 1; i < fdids.Length; ++i) {
+                    if (fdids[i] == 0)
+                        ++sequenceSize;
+                    else {
+                        compressedPages.Add(new (pages.Count, fdids[initialFileDataID], (byte) sequenceSize));
+
+                        initialFileDataID = i;
+                        sequenceSize = 0;
+                    }
+
                     fdids[i] += fdids[i - 1] + 1;
+                }
+
+                compressedPages.Add(new (pages.Count, fdids[initialFileDataID], (byte) sequenceSize));
 
                 // Get a span over the actual record block of this page
                 var recordData = blockData[(4 * recordCount)..];
@@ -130,6 +152,8 @@ namespace TACTSharp
                 pages.Add(page);
             }
             
+            compressedPages.Sort((left, right) => (int) left.FirstFDID - (int) right.FirstFDID);
+            _compressedPages = [.. compressedPages];
             _pages = [.. pages];
             _hashes.TrimExcess();
         }
@@ -174,16 +198,34 @@ namespace TACTSharp
         /// <returns>An optional record.</returns>
         public ref Record FindFileDataID(uint fileDataID)
         {
-            foreach (ref readonly var page in _pages.AsSpan())
+            // Compressed pages are sorted so binary search across.
+            var compressedPageIndex = _compressedPages.LowerBound(static (ref CompressedPage page, int fileDataID) =>
             {
-                var fdidIndex = page.Records.BinarySearch((ref Record record, int fileDataID) => ((int) record.FileDataID - fileDataID).ToOrdering(), (int) fileDataID);
-                if (fdidIndex < 0)
-                    continue;
+                var difference = fileDataID - (int) page.FirstFDID;
+                if (difference >= page.Length)
+                    return Ordering.Less;
 
-                return ref page.Records.UnsafeIndex(fdidIndex);
-            }
+                if (difference < 0)
+                    return Ordering.Greater;
 
-            return ref Unsafe.NullRef<Record>();
+                return Ordering.Equal;
+            }, (int) fileDataID);
+
+            if (compressedPageIndex < 0)
+                return ref Unsafe.NullRef<Record>();
+
+            // Easy direct indexing
+            ref var compressedPage = ref _compressedPages.UnsafeIndex(compressedPageIndex);
+            ref var page = ref _pages.UnsafeIndex(compressedPage.PageIndex);
+
+            var fdidIndex = page.Records.BinarySearch((ref Record record, int fileDataID) => {
+                return ((int)record.FileDataID - fileDataID).ToOrdering();
+            }, (int) fileDataID);
+
+            if (fdidIndex < 0)
+                return ref Unsafe.NullRef<Record>();
+
+            return ref page.Records.UnsafeIndex(fdidIndex);
         }
 
         /// <summary>
@@ -270,6 +312,8 @@ namespace TACTSharp
         }
 
         private readonly record struct Page(Record[] Records, ContentFlags ContentFlags, LocaleFlags LocaleFlags);
+
+        private readonly record struct CompressedPage(int PageIndex, uint FirstFDID, byte Length);
 
         private enum Format
         {
